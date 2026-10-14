@@ -23,6 +23,8 @@ Metadata-only create/list/inspect/configure/rename/export do not contact the Pod
 
 Transport initialization captures the selected connection generation under a lock. Switching or canceling the connection cancels an unfinished handshake; a completed old-host binding cannot be published into the new selection. Cached TUI bindings must match the selected URI and identity.
 
+Application JSON input is limited to 1 MiB, with oversize input rejected before decoding. Unknown fields and trailing JSON are errors; whitespace cannot hide an additional payload beyond the read limit.
+
 For ports, limits, storage or environment configuration, create from a JSON file (`--file path`, or `--file -` for stdin):
 
 ```json

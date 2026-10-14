@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -27,7 +28,14 @@ func decodeApplication(file string, input io.Reader) (deploy.Application, error)
 		defer f.Close()
 		input = f
 	}
-	decoder := json.NewDecoder(io.LimitReader(input, 1<<20))
+	data, err := io.ReadAll(io.LimitReader(input, (1<<20)+1))
+	if err != nil {
+		return a, err
+	}
+	if len(data) > 1<<20 {
+		return a, errors.New("application file exceeds 1 MiB")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&a); err != nil {
 		return a, err
