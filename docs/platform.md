@@ -2,6 +2,8 @@
 
 The existing Podman screens remain available. F9 opens Applications / Services; `m` opens contextual commands, Enter inspects runtime health, and Esc cancels an active operation or closes a dialog. Configuration editing uses JSON in the TUI (Ctrl+S saves), including non-sensitive environment variables, profiles, ports, persistent mappings and secret references. Saved configuration is desired state; apply it with deploy. Existing F1–F8 and h/l/j/k navigation remain assigned as before.
 
+Application rows, command menus and delayed dialogs are bound to the connection URI/identity that produced them. Results from a previous host cannot replace the current catalog, and mutations use immutable application IDs so rename/name reuse cannot redirect an action.
+
 The deployment module has no application daemon or metadata database. It uses the repository's existing Podman v6 Go bindings, Git CLI, private connection-scoped JSON and optional host integrations. Podman socket activation/Machine, Nginx and host schedulers are separate platform dependencies, not a Podman-TUI daemon.
 
 ## Start from an image

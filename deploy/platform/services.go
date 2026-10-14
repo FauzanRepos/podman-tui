@@ -93,5 +93,5 @@ func LinkService(m *deploy.Manager, applicationName, serviceName string, injectH
 		}
 	}
 	application.Profiles[application.Profile] = cfg
-	return m.Configure(application.Name, application)
+	return m.Configure("@"+application.ID, application)
 }

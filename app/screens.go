@@ -181,7 +181,7 @@ func (app *App) clearViewsData() {
 	app.secrets.ClearData()
 	app.secrets.HideAllDialogs()
 
-	app.applications.Cancel()
+	app.applications.ClearData()
 }
 
 func (app *App) clearInfoUIData() {
