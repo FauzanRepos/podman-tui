@@ -29,7 +29,7 @@ type SecretCreateOptions struct {
 
 // Create creates a new secret.
 func Create(opts *SecretCreateOptions) error { //nolint:cyclop
-	log.Debug().Msgf("pdcs: podman secret create %v", opts)
+	log.Debug().Msg("pdcs: podman secret create")
 
 	var reader io.Reader
 

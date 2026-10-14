@@ -112,7 +112,7 @@ func Create(opts CreateOptions, run bool) ([]string, string, error) { //nolint:c
 		createOptions   entities.ContainerCreateOptions
 	)
 
-	log.Debug().Msgf("pdcs: podman container create %v", opts)
+	log.Debug().Msg("pdcs: podman container create")
 	utils.DefineCreateDefaults(&createOptions)
 
 	conn, err := registry.GetConnection()

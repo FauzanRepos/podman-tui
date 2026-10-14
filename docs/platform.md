@@ -46,6 +46,8 @@ podman-tui platform deploy web --connection my-host
 
 Profile names are development, staging and production. `env` is explicitly **non-sensitive** configuration. Secrets belong in Podman and metadata contains only `{"name":"db-password","target":"DB_PASSWORD","type":"env"}` or a `mount` reference. Do not put credentials in image/Git URLs, JSON, command arguments, build instructions or terminal previews. Create a Podman secret with `platform secret-create NAME` reading stdin, or use the existing Secrets screen/Podman tools. Environment secret values are not returned by platform status/history/export. Images and application processes remain responsible for not logging their own credentials.
 
+The original Secrets inspection screen now requests metadata only. Managed-container inspection redacts **all runtime environment values** while retaining their variable names; unmanaged container inspection is unchanged. Container/secret create debug logs no longer dump configuration or secret input. A dedicated rootless integration scenario verifies these original inspection paths with a real environment-secret deployment.
+
 Ports default to loopback. A host port of zero requests dynamic publication. Bind mounts name **server-side** paths; workstation paths are not implicitly available on remote servers. Named volumes are created with application ownership labels; a collision with an unmanaged/other application's volume is rejected. Application deletion never removes volumes, networks or secrets.
 
 ## Lifecycle and safe replacement

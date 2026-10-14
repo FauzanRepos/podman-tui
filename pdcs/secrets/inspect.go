@@ -18,7 +18,7 @@ func Inspect(id string) (string, error) {
 		return report, err
 	}
 
-	response, err := secrets.Inspect(conn, id, new(secrets.InspectOptions).WithShowSecret(true))
+	response, err := secrets.Inspect(conn, id, new(secrets.InspectOptions).WithShowSecret(false))
 	if err != nil {
 		return report, err
 	}
