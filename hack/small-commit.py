@@ -7,6 +7,7 @@ import re
 import shlex
 import subprocess
 import sys
+from urllib.parse import urlsplit
 
 
 def git(*args):
@@ -26,7 +27,8 @@ def main():
     if git("diff", "--cached", "--name-only", "-z"):
         parser.error("index is not empty; inspect existing staged changes first")
     paths = []
-    suspicious = re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----|(?:ghp_|github_pat_|sk_live_|AKIA)[A-Za-z0-9_]{16,}|https?://[^\s/@]+:[^\s/@]+@")
+    suspicious = re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----|(?:ghp_|github_pat_|sk_live_|AKIA)[A-Za-z0-9_]{16,}")
+    credential_url = re.compile(rb"https?://[^\s/@]+:[^\s/@]+@[^\s\"'<>\\]+")
     for value in args.files:
         p = Path(value)
         if p.is_absolute() or ".." in p.parts or value.startswith("-"):
@@ -38,6 +40,10 @@ def main():
         content = p.read_bytes()
         if b"\0" in content or suspicious.search(content):
             parser.error("binary or likely credential detected in selected file: " + value)
+        for match in credential_url.finditer(content):
+            hostname = urlsplit(match.group().decode("utf-8", "replace")).hostname or ""
+            if not (p.name.endswith("_test.go") and hostname.endswith(".invalid")):
+                parser.error("credential-bearing URL detected in selected file: " + value)
         paths.append(value)
     print(git("status", "--short", "--branch").decode(), end="")
     subprocess.run(["git", "diff", "--", *paths], check=True)

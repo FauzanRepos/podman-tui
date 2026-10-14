@@ -14,6 +14,7 @@ This repository has no existing agent command-registration convention. This is a
    ```
 
    The validation command is trusted maintainer input, not application/repository data. The helper refuses any pre-existing staged changes, validates path confinement, checks selected content for likely credentials/artifacts, runs validation before staging, stages only the allowlist, checks the index and creates a DCO-signed commit. It never amends or pushes. Secret detection is a guardrail, not a security certification; manual review remains required.
+   Negative credential-URL fixtures are admitted only in `_test.go` files using reserved `.invalid` hosts; key/token detection still applies. Exercise the guard with `python3 hack/small_commit_test.py`, which uses disposable repositories rather than the user's index.
 5. Return the printed commit hash and logical summary. Continue with the next logical change. A failed validation creates no commit. If commit creation fails, the selected files remain staged; inspect and resolve deliberately, not by staging everything.
 
 On a dirty baseline, use explicit patches and inspect the resulting index manually. Preserve unrelated changes. Never use `git add .`, `git add -A`, reset, clean, amend, force-update or push as part of this workflow.
