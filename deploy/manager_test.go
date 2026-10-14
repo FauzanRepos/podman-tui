@@ -32,6 +32,13 @@ func (f *fakeRuntime) Create(_ context.Context, _ Application, r Release) (Candi
 func (f *fakeRuntime) PinImage(_ context.Context, _ Application, r Release) (string, error) {
 	return "hold-" + r.ID, nil
 }
+func (f *fakeRuntime) FindImagePin(_ context.Context, _ Application, r Release) (string, error) {
+	id := "hold-" + r.ID
+	if _, exists := f.running[id]; exists {
+		return id, nil
+	}
+	return "", ErrNotFound
+}
 func (f *fakeRuntime) Endpoint(context.Context, Application, string) (string, error) {
 	return "", nil
 }

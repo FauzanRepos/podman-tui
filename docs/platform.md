@@ -60,13 +60,15 @@ podman-tui platform rename web api --connection my-host
 podman-tui platform delete api --yes --connection my-host
 ```
 
-Containers use immutable IDs and owner/application/release labels. Every mutation inspects exact ownership; no global prune or automatic deletion of unmanaged resources is performed. Rename preserves application identity, deployment history and container labels.
+Containers use immutable IDs and owner/application/release labels. Every mutation inspects exact ownership; no global prune or automatic deletion of unmanaged resources is performed. Rename preserves application identity, deployment history and container labels. Interactive operations bind to immutable application identity, not a display name that could be reused.
 
 A replacement is independently created, started and checked before routing commit and old-container retirement. Running readiness requires three consecutive running observations; it is **not an application-level readiness guarantee**. `health` requires an image HEALTHCHECK; `http` requires an explicit published proxy endpoint and a successful 2xx path response. Readiness and overall CLI operation timeouts are bounded.
 
 Fixed host ports or exclusive writable volumes cannot be safely overlapped. Explicit `--maintenance` authorizes temporary downtime: source/image preparation happens first, the old container is stopped but retained, and a failed replacement restores it. `concurrent_safe` authorizes overlapping volume writers only when the application itself supports it. Neither flag reverts database migrations. Do not advertise universal zero downtime.
 
 Failed candidates preserve the committed release and record failure in history. If routing recovery itself fails, both resources and an in-progress journal are preserved instead of deleting a potentially routed healthy candidate. Investigate the error and use `recover-abort NAME --yes` to restore the committed release deliberately. Recovery can require maintenance downtime. Disconnect/cancellation cannot make a broken remote host recoverable; errors remain explicit.
+
+Confirmed interrupted recovery reconciles both the presence and absence of predecessor routing before removing the candidate. A crash-created image holder whose ID was not yet saved is discovered by exact application/release/role/image identity; retained successful holders remain protected. Recovery stops an active unchanged unit before replacing its boot definition.
 
 ## History and rollback
 
@@ -76,7 +78,7 @@ podman-tui platform rollback web RELEASE-ID --connection my-host
 podman-tui platform cleanup web --yes --connection my-host
 ```
 
-Rollback redeploys a retained successful release's immutable image and configuration snapshot. Old stopped containers pin images. A missing image is an error, not a fallback to a moving tag. Cleanup explicitly removes only eligible stopped managed release containers according to retention; volumes and unrelated images remain untouched. Historical database schema/data are not restored. Application-level backups and compatible migrations are operator responsibilities.
+Rollback redeploys a retained successful release's immutable image and configuration snapshot. Old stopped containers and optional stopped image holders pin images, including when Quadlet recreates/removes a runtime container. A missing image is an error, not a fallback to a moving tag. Cleanup explicitly removes only eligible stopped managed release containers/holders according to retention, including crash-created holders; volumes and unrelated images remain untouched. Historical database schema/data are not restored. Application-level backups and compatible migrations are operator responsibilities.
 
 ## Verification status
 

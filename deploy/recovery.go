@@ -63,6 +63,20 @@ func (m *Manager) RecoverAbort(ctx context.Context, name string, confirmed bool)
 					return err
 				}
 				if installed {
+					active, e := m.Startup.Active(ctx, a)
+					if e != nil {
+						return e
+					}
+					if active {
+						// Stop the unchanged live definition before Refresh can alter ExecStop.
+						if e = m.Startup.Control(ctx, a, "stop"); e != nil {
+							return e
+						}
+						previous, status, lookupErr = m.resolveCurrent(ctx, old.Snapshot, old)
+						if lookupErr != nil && !errors.Is(lookupErr, ErrNotFound) {
+							return lookupErr
+						}
+					}
 					if err = m.Startup.Refresh(ctx, old.Snapshot, old); err != nil {
 						return err
 					}
@@ -102,6 +116,18 @@ func (m *Manager) RecoverAbort(ctx context.Context, name string, confirmed bool)
 					return err
 				}
 			}
+			if old.Snapshot.Proxy == nil && pending.Snapshot.Proxy != nil {
+				if m.Router == nil {
+					return errors.New("proxy adapter required for recovery")
+				}
+				if err = m.Router.Remove(ctx, pending.Snapshot); err != nil {
+					return err
+				}
+			}
+			if err = m.discoverPin(ctx, old.Snapshot, &old); err != nil {
+				return err
+			}
+			session.State.Releases[previousIndex].ImagePinID = old.ImagePinID
 			session.State.Releases[previousIndex].ContainerID = previous.ID
 			session.State.Releases[previousIndex].Endpoint = previous.Endpoint
 		} else if pending.Snapshot.Proxy != nil {
@@ -117,6 +143,15 @@ func (m *Manager) RecoverAbort(ctx context.Context, name string, confirmed bool)
 				return err
 			}
 			pending.ContainerID = candidate.ID
+		}
+		if err = m.discoverPin(ctx, pending.Snapshot, pending); err != nil {
+			return err
+		}
+		if pending.ImagePinID != "" {
+			if err = m.Runtime.Remove(ctx, pending.Snapshot, pending.ImagePinID); err != nil {
+				return err
+			}
+			pending.ImagePinID = ""
 		}
 		pending.Status = "failed"
 		pending.Stage = "recovered"

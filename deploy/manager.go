@@ -52,6 +52,11 @@ func defaults(a *Application) {
 }
 
 func appIndex(s State, name string) int {
+	// @ID cannot be a valid application name; interactive callers bind mutations
+	// to an immutable identity even if the displayed name is renamed/reused.
+	if strings.HasPrefix(name, "@") {
+		return slices.IndexFunc(s.Applications, func(a Application) bool { return a.ID == strings.TrimPrefix(name, "@") })
+	}
 	return slices.IndexFunc(s.Applications, func(a Application) bool { return a.Name == name })
 }
 func releaseIndex(s State, id string) int {
@@ -354,6 +359,9 @@ func (m *Manager) Delete(ctx context.Context, name string, confirmed bool) error
 	for _, release := range session.State.Releases {
 		if release.ApplicationID != a.ID {
 			continue
+		}
+		if err = m.discoverPin(ctx, a, &release); err != nil {
+			return err
 		}
 		for _, id := range []string{release.ContainerID, release.ImagePinID} {
 			if id != "" {
@@ -817,6 +825,9 @@ func (m *Manager) Cleanup(ctx context.Context, name string, confirmed bool) erro
 				return err
 			}
 		}
+		if err = m.discoverPin(ctx, a, r); err != nil {
+			return err
+		}
 		if r.ImagePinID != "" {
 			if err = m.Runtime.Remove(ctx, a, r.ImagePinID); err != nil {
 				return err
@@ -827,4 +838,19 @@ func (m *Manager) Cleanup(ctx context.Context, name string, confirmed bool) erro
 		r.Status = "retired"
 	}
 	return session.Save()
+}
+
+func (m *Manager) discoverPin(ctx context.Context, a Application, r *Release) error {
+	if r.ImagePinID != "" {
+		return nil
+	}
+	id, err := m.Runtime.FindImagePin(ctx, a, *r)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	r.ImagePinID = id
+	return nil
 }

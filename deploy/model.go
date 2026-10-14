@@ -153,6 +153,7 @@ type Runtime interface {
 	Build(context.Context, SourceTree, string, io.Writer) (string, error)
 	Create(context.Context, Application, Release) (Candidate, error)
 	PinImage(context.Context, Application, Release) (string, error)
+	FindImagePin(context.Context, Application, Release) (string, error)
 	Inspect(context.Context, Application, string) (RuntimeStatus, error)
 	Endpoint(context.Context, Application, string) (string, error)
 	Find(context.Context, Application, string) (Candidate, error)
