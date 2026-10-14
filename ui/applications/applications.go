@@ -1,0 +1,430 @@
+// Package applications extends the existing tview screens with managed applications.
+package applications
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"sync"
+	"time"
+
+	"github.com/containers/podman-tui/deploy"
+	"github.com/containers/podman-tui/deploy/platform"
+	"github.com/containers/podman-tui/pdcs/registry"
+	"github.com/containers/podman-tui/ui/style"
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
+)
+
+type Applications struct {
+	*tview.Pages
+	table      *tview.Table
+	output     *tview.TextView
+	status     *tview.TextView
+	apps       []deploy.Application
+	queue      func(func())
+	focus      func(tview.Primitive)
+	connection func() registry.Connection
+	dialog     string
+	mu         sync.Mutex
+	busy       bool
+	refreshing bool
+	cancel     context.CancelFunc
+}
+
+func New(queue func(func()), focus func(tview.Primitive), connection func() registry.Connection) *Applications {
+	p := &Applications{Pages: tview.NewPages(), table: tview.NewTable(), output: tview.NewTextView(), status: tview.NewTextView(), queue: queue, focus: focus, connection: connection}
+	p.table.SetBorder(true).SetTitle("APPLICATIONS / SERVICES").SetBorderColor(style.BorderColor).SetBackgroundColor(style.BgColor)
+	p.table.SetSelectable(true, false).SetFixed(1, 0).SetSelectedStyle(style.TableSelectedStyle)
+	p.output.SetBorder(true).SetTitle("DEPLOYMENT OUTPUT (bounded, Esc cancels)").SetBorderColor(style.BorderColor).SetBackgroundColor(style.BgColor)
+	p.output.SetDynamicColors(false).SetWrap(true).SetTextColor(style.FgColor)
+	p.status.SetText("m commands • Enter status • j/k select • F9 applications • Esc close/cancel").SetTextColor(style.FgColor).SetBackgroundColor(style.BgColor)
+	layout := tview.NewFlex().SetDirection(tview.FlexRow).AddItem(p.table, 0, 2, true).AddItem(p.output, 0, 1, false).AddItem(p.status, 2, 0, false)
+	p.AddPage("main", layout, true, true)
+	p.table.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEnter:
+			p.action("status")
+			return nil
+		case tcell.KeyDelete:
+			p.action("delete")
+			return nil
+		case tcell.KeyEsc:
+			p.Cancel()
+			return nil
+		}
+		switch event.Rune() {
+		case 'm':
+			p.menu()
+			return nil
+		case 'j':
+			return tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone)
+		case 'k':
+			return tcell.NewEventKey(tcell.KeyUp, 0, tcell.ModNone)
+		}
+		return event
+	})
+	p.render(nil)
+	return p
+}
+func (p *Applications) GetTitle() string        { return "applications" }
+func (p *Applications) SubDialogHasFocus() bool { return p.dialog != "" }
+func (p *Applications) Cancel() {
+	p.mu.Lock()
+	cancel := p.cancel
+	p.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+func (p *Applications) RequestExit() bool {
+	p.mu.Lock()
+	busy := p.busy
+	cancel := p.cancel
+	p.mu.Unlock()
+	if busy && cancel != nil {
+		cancel()
+		return false
+	}
+	return true
+}
+func (p *Applications) ClearData()      { p.Cancel(); p.queue(func() { p.apps = nil; p.render(nil) }) }
+func (p *Applications) HideAllDialogs() { p.queue(p.closeDialog) }
+func (p *Applications) closeDialog() {
+	if p.dialog != "" {
+		p.RemovePage(p.dialog)
+		p.dialog = ""
+	}
+	p.focus(p.table)
+}
+func (p *Applications) showDialog(primitive tview.Primitive) {
+	p.closeDialog()
+	p.dialog = "dialog"
+	p.AddPage(p.dialog, primitive, true, true)
+	p.focus(primitive)
+}
+func (p *Applications) selected() (deploy.Application, error) {
+	row, _ := p.table.GetSelection()
+	if row < 1 || row > len(p.apps) {
+		return deploy.Application{}, errors.New("select an application first")
+	}
+	return p.apps[row-1], nil
+}
+func (p *Applications) render(apps []deploy.Application) {
+	p.apps = apps
+	p.table.Clear()
+	for i, h := range []string{"name", "kind", "profile", "release"} {
+		p.table.SetCell(0, i, tview.NewTableCell(h).SetSelectable(false).SetTextColor(style.FgColor))
+	}
+	for row, a := range apps {
+		release := a.CurrentRelease
+		if len(release) > 12 {
+			release = release[:12]
+		}
+		for col, text := range []string{a.Name, a.Kind, a.Profile, release} {
+			p.table.SetCell(row+1, col, tview.NewTableCell(deploy.Sanitize(text)).SetTextColor(style.FgColor))
+		}
+	}
+	if len(apps) > 0 {
+		p.table.Select(1, 0)
+	}
+}
+
+func (p *Applications) run(connect bool, action func(context.Context, *deploy.Manager, io.Writer) error) {
+	p.mu.Lock()
+	if p.busy {
+		p.mu.Unlock()
+		return
+	}
+	p.busy = true
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	p.cancel = cancel
+	p.mu.Unlock()
+	conn := p.connection() // freeze endpoint before starting the worker
+	p.output.SetText("")
+	p.status.SetText("Working on " + deploy.Sanitize(conn.Name) + "; Esc cancels safely")
+	go func() {
+		var logs deploy.LogBuffer
+		writer := &screenWriter{buffer: &logs, page: p}
+		var m *deploy.Manager
+		var close func()
+		var err error
+		if connect {
+			frozen, connectionErr := registry.GetCachedConnection(conn)
+			if connectionErr != nil {
+				err = connectionErr
+			} else {
+				m, close, err = platform.OpenFrozen(ctx, "", conn, false, frozen)
+			}
+		} else {
+			m, _, close, err = platform.Open(ctx, "", conn, false, false)
+		}
+		if err == nil {
+			err = action(ctx, m, writer)
+			close()
+		}
+		var apps []deploy.Application
+		if m != nil {
+			apps, _ = m.List()
+		}
+		cancel()
+		p.mu.Lock()
+		p.busy = false
+		p.cancel = nil
+		p.mu.Unlock()
+		p.queue(func() {
+			p.render(apps)
+			p.output.SetText(logs.String())
+			if err != nil {
+				p.status.SetText("Error: " + deploy.Sanitize(err.Error()))
+			} else {
+				p.status.SetText("Complete • m commands • Enter runtime health • Esc close/cancel")
+			}
+		})
+	}()
+}
+func (p *Applications) UpdateData() {
+	p.mu.Lock()
+	if p.busy || p.refreshing {
+		p.mu.Unlock()
+		return
+	}
+	p.refreshing = true
+	p.mu.Unlock()
+	conn := p.connection()
+	go func() {
+		manager, _, close, err := platform.Open(context.Background(), "", conn, false, false)
+		var apps []deploy.Application
+		if err == nil {
+			apps, err = manager.List()
+			close()
+		}
+		p.mu.Lock()
+		p.refreshing = false
+		p.mu.Unlock()
+		p.queue(func() {
+			if p.connection().URI != conn.URI {
+				return
+			}
+			if err != nil {
+				p.status.SetText("Error: " + deploy.Sanitize(err.Error()))
+				return
+			}
+			row, _ := p.table.GetSelection()
+			p.render(apps)
+			if row > 0 && row <= len(apps) {
+				p.table.Select(row, 0)
+			}
+		})
+	}()
+}
+
+type screenWriter struct {
+	buffer *deploy.LogBuffer
+	page   *Applications
+	last   time.Time
+	mu     sync.Mutex
+}
+
+func (w *screenWriter) Write(data []byte) (int, error) {
+	n, err := w.buffer.Write(data)
+	w.mu.Lock()
+	if time.Since(w.last) > 100*time.Millisecond {
+		w.last = time.Now()
+		text := w.buffer.String()
+		w.page.queue(func() { w.page.output.SetText(text) })
+	}
+	w.mu.Unlock()
+	return n, err
+}
+
+func (p *Applications) menu() {
+	list := tview.NewList().ShowSecondaryText(true)
+	list.SetBorder(true).SetTitle("APPLICATION COMMANDS")
+	for _, action := range []string{"create", "configure", "inspect", "status", "deploy", "deploy-maintenance", "rebuild", "rollback", "history", "start", "stop", "restart", "rename", "service-create", "service-link", "tls-status", "tls-issue", "tls-import", "tls-renew", "quadlet-status", "quadlet-enable", "quadlet-disable", "delete", "cleanup", "recover-abort"} {
+		action := action
+		list.AddItem(action, "managed applications only", 0, func() { p.closeDialog(); p.action(action) })
+	}
+	list.SetInputCapture(func(e *tcell.EventKey) *tcell.EventKey {
+		if e.Key() == tcell.KeyEsc {
+			p.closeDialog()
+			return nil
+		}
+		return e
+	})
+	p.showDialog(list)
+}
+func (p *Applications) action(action string) {
+	if action == "create" {
+		p.createForm()
+		return
+	}
+	if action == "service-create" {
+		p.serviceForm()
+		return
+	}
+	a, err := p.selected()
+	if err != nil {
+		p.status.SetText(err.Error())
+		return
+	}
+	if p.integrationAction(a, action) {
+		return
+	}
+	if action == "deploy-maintenance" {
+		p.confirm("Authorize maintenance downtime for "+a.Name+"? Persistent data/migrations are unchanged.", func() { p.execute(a, action, true) })
+		return
+	}
+	if action == "configure" {
+		p.configureForm(a)
+		return
+	}
+	if action == "rename" {
+		p.renameForm(a)
+		return
+	}
+	if action == "delete" || action == "cleanup" || action == "recover-abort" {
+		p.confirm(action+" "+a.Name+"? Persistent volumes and unmanaged resources are preserved.", func() { p.execute(a, action, true) })
+		return
+	}
+	if action == "rollback" {
+		p.rollback(a)
+		return
+	}
+	p.execute(a, action, false)
+}
+func (p *Applications) confirm(message string, action func()) {
+	modal := tview.NewModal().SetText(message).AddButtons([]string{"Cancel", "Confirm"}).SetDoneFunc(func(index int, _ string) {
+		p.closeDialog()
+		if index == 1 {
+			action()
+		}
+	})
+	p.showDialog(modal)
+}
+func (p *Applications) execute(a deploy.Application, action string, confirmed bool) {
+	connect := action != "inspect" && action != "history"
+	p.run(connect, func(ctx context.Context, m *deploy.Manager, out io.Writer) error {
+		switch action {
+		case "inspect":
+			value, err := m.Get(a.Name)
+			if err != nil {
+				return err
+			}
+			return json.NewEncoder(out).Encode(value)
+		case "history":
+			value, err := m.History(a.Name)
+			if err != nil {
+				return err
+			}
+			return json.NewEncoder(out).Encode(value)
+		case "status":
+			value, err := m.Status(ctx, a.Name)
+			if err != nil {
+				return err
+			}
+			return json.NewEncoder(out).Encode(value)
+		case "start", "stop", "restart":
+			return m.Lifecycle(ctx, a.Name, action)
+		case "delete":
+			return m.Delete(ctx, a.Name, confirmed)
+		case "cleanup":
+			return m.Cleanup(ctx, a.Name, confirmed)
+		case "recover-abort":
+			return m.RecoverAbort(ctx, a.Name, confirmed)
+		default:
+			_, err := m.Deploy(ctx, a.Name, deploy.DeployOptions{Rebuild: action == "rebuild", Maintenance: action == "deploy-maintenance" && confirmed}, func(e deploy.Event) {
+				p.queue(func() { p.status.SetText("Deployment: " + e.Stage + " • Esc cancels") })
+			}, out)
+			return err
+		}
+	})
+}
+func (p *Applications) createForm() {
+	form := tview.NewForm()
+	name, image, repository, revision := "", "", "", "main"
+	trusted := false
+	form.AddInputField("name", "", 0, nil, func(v string) { name = v }).AddInputField("image", "", 0, nil, func(v string) { image = v }).AddInputField("repository", "", 0, nil, func(v string) { repository = v }).AddInputField("revision", revision, 0, nil, func(v string) { revision = v }).AddCheckbox("Trust build", false, func(v bool) { trusted = v })
+	form.AddButton("Create", func() {
+		p.closeDialog()
+		p.run(false, func(_ context.Context, m *deploy.Manager, _ io.Writer) error {
+			a := deploy.Application{Name: name, Image: image}
+			if repository != "" {
+				a.Repository = &deploy.GitConfig{URL: repository, Revision: revision, Trusted: trusted}
+			}
+			_, err := m.Create(a)
+			return err
+		})
+	}).AddButton("Cancel", p.closeDialog)
+	form.SetBorder(true).SetTitle("CREATE APPLICATION")
+	form.SetCancelFunc(p.closeDialog)
+	p.showDialog(form)
+}
+func (p *Applications) configureForm(a deploy.Application) {
+	data, _ := json.MarshalIndent(a, "", "  ")
+	editor := tview.NewTextArea().SetText(string(data), false).SetWrap(false)
+	editor.SetBorder(true).SetTitle("CONFIGURATION: non-sensitive env / secret refs / profiles / ports / domains (Ctrl+S saves)")
+	editor.SetInputCapture(func(e *tcell.EventKey) *tcell.EventKey {
+		if e.Key() == tcell.KeyEsc {
+			p.closeDialog()
+			return nil
+		}
+		if e.Key() == tcell.KeyCtrlS {
+			value := editor.GetText()
+			p.closeDialog()
+			p.run(false, func(_ context.Context, m *deploy.Manager, _ io.Writer) error {
+				var updated deploy.Application
+				if err := json.Unmarshal([]byte(value), &updated); err != nil {
+					return err
+				}
+				return m.Configure(a.Name, updated)
+			})
+			return nil
+		}
+		return e
+	})
+	p.showDialog(editor)
+}
+func (p *Applications) renameForm(a deploy.Application) {
+	name := a.Name
+	form := tview.NewForm().AddInputField("new name", name, 0, nil, func(v string) { name = v })
+	form.AddButton("Rename", func() {
+		p.closeDialog()
+		p.run(false, func(_ context.Context, m *deploy.Manager, _ io.Writer) error { return m.Rename(a.Name, name) })
+	}).AddButton("Cancel", p.closeDialog)
+	form.SetBorder(true).SetTitle("RENAME APPLICATION")
+	form.SetCancelFunc(p.closeDialog)
+	p.showDialog(form)
+}
+func (p *Applications) rollback(a deploy.Application) {
+	p.run(false, func(_ context.Context, m *deploy.Manager, _ io.Writer) error {
+		history, err := m.History(a.Name)
+		if err != nil {
+			return err
+		}
+		p.queue(func() {
+			list := tview.NewList()
+			list.SetBorder(true).SetTitle("ROLLBACK (persistent data/migrations unchanged)")
+			for i := len(history) - 1; i >= 0; i-- {
+				r := history[i]
+				if r.Status != "successful" {
+					continue
+				}
+				list.AddItem(r.ID, fmt.Sprintf("%s %s", r.Timestamp.Format(time.RFC3339), r.ImageID), 0, func() {
+					p.closeDialog()
+					p.confirm("Rollback "+a.Name+" to "+r.ID+"? Database migrations are not reverted.", func() {
+						p.run(true, func(ctx context.Context, m *deploy.Manager, out io.Writer) error {
+							_, err := m.Deploy(ctx, a.Name, deploy.DeployOptions{RollbackRelease: r.ID}, nil, out)
+							return err
+						})
+					})
+				})
+			}
+			list.AddItem("Cancel", "", 0, p.closeDialog)
+			p.showDialog(list)
+		})
+		return nil
+	})
+}

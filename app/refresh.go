@@ -68,7 +68,9 @@ func (app *App) refreshNotConnOK() {
 	// only switch to system view one time
 	if !app.needInitUI {
 		app.clearViewsData()
-		app.switchToScreen(app.system.GetTitle())
+		if app.currentPage != app.applications.GetTitle() {
+			app.switchToScreen(app.system.GetTitle())
+		}
 	}
 
 	app.system.UpdateData()

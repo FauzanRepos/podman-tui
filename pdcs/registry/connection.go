@@ -56,3 +56,17 @@ func GetConnection() (context.Context, error) {
 
 	return *pdcsRegistry.connContext, nil
 }
+
+// GetCachedConnection captures a ready binding context without initializing another transport.
+// Metadata and context are checked under one lock so TUI operations cannot drift to another host.
+func GetCachedConnection(expected Connection) (context.Context, error) {
+	pdcsRegistry.mu.Lock()
+	defer pdcsRegistry.mu.Unlock()
+	if !pdcsRegistry.connectionIsSet || pdcsRegistry.connection.Status != ConnectionStatusConnected {
+		return nil, errors.New("connect a Podman server before running application operations")
+	}
+	if pdcsRegistry.connection.URI != expected.URI || pdcsRegistry.connection.Identity != expected.Identity || pdcsRegistry.connContext == nil {
+		return nil, errors.New("Podman connection changed; retry the operation")
+	}
+	return *pdcsRegistry.connContext, nil
+}

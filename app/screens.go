@@ -30,6 +30,8 @@ func (app *App) frontScreenHasActiveDialog() bool {
 		return app.volumes.SubDialogHasFocus()
 	case app.secrets.GetTitle():
 		return app.secrets.SubDialogHasFocus()
+	case app.applications.GetTitle():
+		return app.applications.SubDialogHasFocus()
 	}
 
 	return false
@@ -40,9 +42,9 @@ func (app *App) switchToPreviousScreen() {
 
 	switch app.currentPage {
 	case app.help.GetTitle():
-		previousScreen = app.secrets.GetTitle()
+		previousScreen = app.applications.GetTitle()
 	case app.system.GetTitle():
-		previousScreen = app.secrets.GetTitle()
+		previousScreen = app.applications.GetTitle()
 	case app.pods.GetTitle():
 		previousScreen = app.system.GetTitle()
 	case app.containers.GetTitle():
@@ -55,6 +57,8 @@ func (app *App) switchToPreviousScreen() {
 		previousScreen = app.images.GetTitle()
 	case app.secrets.GetTitle():
 		previousScreen = app.networks.GetTitle()
+	case app.applications.GetTitle():
+		previousScreen = app.secrets.GetTitle()
 	}
 
 	app.switchToScreen(previousScreen)
@@ -79,6 +83,8 @@ func (app *App) switchToNextScreen() {
 	case app.networks.GetTitle():
 		nextScreen = app.secrets.GetTitle()
 	case app.secrets.GetTitle():
+		nextScreen = app.applications.GetTitle()
+	case app.applications.GetTitle():
 		nextScreen = app.system.GetTitle()
 	}
 
@@ -103,10 +109,16 @@ func (app *App) setPageFocus(page string) {
 		app.SetFocus(app.volumes)
 	case app.secrets.GetTitle():
 		app.SetFocus(app.secrets)
+	case app.applications.GetTitle():
+		app.SetFocus(app.applications)
 	}
 }
 
 func (app *App) updatePageData(page string) {
+	if page == app.applications.GetTitle() {
+		app.applications.UpdateData()
+		return
+	}
 	connStatus, _ := app.health.ConnStatus()
 	if connStatus != registry.ConnectionStatusConnected {
 		return
@@ -136,6 +148,9 @@ func (app *App) updatePageDataFromEvent(eventType string) {
 		app.pods.UpdateData()
 	case "container":
 		app.containers.UpdateData()
+		if app.currentPage == app.applications.GetTitle() {
+			app.applications.UpdateData()
+		}
 	case "network":
 		app.networks.UpdateData()
 	case "image":
@@ -165,6 +180,8 @@ func (app *App) clearViewsData() {
 
 	app.secrets.ClearData()
 	app.secrets.HideAllDialogs()
+
+	app.applications.Cancel()
 }
 
 func (app *App) clearInfoUIData() {

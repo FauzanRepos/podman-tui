@@ -6,6 +6,7 @@ import (
 	"github.com/containers/podman-tui/config"
 	"github.com/containers/podman-tui/pdcs/registry"
 	health "github.com/containers/podman-tui/system"
+	"github.com/containers/podman-tui/ui/applications"
 	"github.com/containers/podman-tui/ui/containers"
 	"github.com/containers/podman-tui/ui/help"
 	"github.com/containers/podman-tui/ui/images"
@@ -33,6 +34,7 @@ type App struct {
 	images          *images.Images
 	networks        *networks.Networks
 	secrets         *secrets.Secrets
+	applications    *applications.Applications
 	system          *system.System
 	menu            *tview.TextView
 	health          *health.Engine
@@ -73,6 +75,11 @@ func NewApp(name string, version string) *App {
 	app.networks = networks.NewNetworks()
 	app.secrets = secrets.NewSecrets()
 	app.system = system.NewSystem()
+	app.applications = applications.New(
+		func(update func()) { app.QueueUpdateDraw(update) },
+		func(primitive tview.Primitive) { app.SetFocus(primitive) },
+		registry.SelectedConnection,
+	)
 
 	app.system.SetConnectionListFunc(app.config.RemoteConnections)
 	app.system.SetConnectionSetDefaultFunc(func(name string) error {
@@ -149,6 +156,7 @@ func NewApp(name string, version string) *App {
 		{utils.ImagesScreenKey.Label(), app.images.GetTitle()},
 		{utils.NetworksScreenKey.Label(), app.networks.GetTitle()},
 		{utils.SecretsScreenKey.Label(), app.secrets.GetTitle()},
+		{utils.ApplicationsScreenKey.Label(), app.applications.GetTitle()},
 	}
 
 	app.menu = newMenu(menuItems)
@@ -161,6 +169,7 @@ func NewApp(name string, version string) *App {
 	app.pages.AddPage(app.volumes.GetTitle(), app.volumes, true, false)
 	app.pages.AddPage(app.networks.GetTitle(), app.networks, true, false)
 	app.pages.AddPage(app.secrets.GetTitle(), app.secrets, true, false)
+	app.pages.AddPage(app.applications.GetTitle(), app.applications, true, false)
 
 	return &app
 }
@@ -174,6 +183,16 @@ func (app *App) Run() error { //nolint:cyclop
 		AddItem(app.infoBar, infobar.InfoBarViewHeight, 0, false).
 		AddItem(app.pages, 0, 1, false).
 		AddItem(app.menu, 1, 1, false)
+	menuWidth := tview.TaggedStringWidth(app.menu.GetText(false))
+	lastWidth := 0
+	app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
+		width, _ := screen.Size()
+		if width > 0 && width != lastWidth {
+			flex.ResizeItem(app.menu, (menuWidth+width-1)/width, 0)
+			lastWidth = width
+		}
+		return false
+	})
 
 	// start health check and event parser
 	app.health.Start()
@@ -184,6 +203,9 @@ func (app *App) Run() error { //nolint:cyclop
 	// listen for user input
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == utils.AppExitKey.Key {
+			if !app.applications.RequestExit() {
+				return nil
+			}
 			log.Info().Msg("app: stop")
 			app.Stop()
 			os.Exit(0)
@@ -256,12 +278,16 @@ func (app *App) Run() error { //nolint:cyclop
 				app.switchToScreen(app.secrets.GetTitle())
 
 				return nil
+
+			case utils.ApplicationsScreenKey.EventKey():
+				app.switchToScreen(app.applications.GetTitle())
+				return nil
 			}
 		}
 
 		// if connection is not OK do not display command dialog
 		// except for system view and app exit key
-		if app.currentPage != app.system.GetTitle() {
+		if app.currentPage != app.system.GetTitle() && app.currentPage != app.applications.GetTitle() {
 			connStatus, _ := app.health.ConnStatus()
 			if connStatus != registry.ConnectionStatusConnected {
 				return nil

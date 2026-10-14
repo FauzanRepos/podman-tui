@@ -1,9 +1,12 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/containers/podman-tui/app"
@@ -27,7 +30,9 @@ var rootCmd = &cobra.Command{
 
 // Execute adds all child commands to the root command and sets flags appropriately.
 func Execute() {
-	cobra.CheckErr(rootCmd.Execute())
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	cobra.CheckErr(rootCmd.ExecuteContext(ctx))
 }
 
 func run(cmd *cobra.Command, args []string) error { //nolint:cyclop

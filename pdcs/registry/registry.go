@@ -127,6 +127,13 @@ func ConnectionIdentity() string {
 	return pdcsRegistry.connection.Identity
 }
 
+// SelectedConnection freezes all endpoint metadata in one registry read.
+func SelectedConnection() Connection {
+	pdcsRegistry.mu.Lock()
+	defer pdcsRegistry.mu.Unlock()
+	return pdcsRegistry.connection
+}
+
 func (connStatus ConnStatus) String() string {
 	var status string
 
