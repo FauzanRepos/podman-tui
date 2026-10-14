@@ -118,7 +118,7 @@ func run(cmd *cobra.Command, args []string) error { //nolint:cyclop
 
 	app := app.NewApp(appName, appVersion)
 
-	err = app.Run()
+	err = app.Run(cmd.Context())
 	if err != nil {
 		if setSSHIdentityPassphrase {
 			os.Unsetenv("CONTAINER_PASSPHRASE") //nolint:errcheck

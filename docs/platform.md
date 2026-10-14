@@ -4,6 +4,8 @@ The existing Podman screens remain available. F9 opens Applications / Services; 
 
 Application rows, command menus and delayed dialogs are bound to the connection URI/identity that produced them. Results from a previous host cannot replace the current catalog, and mutations use immutable application IDs so rename/name reuse cannot redirect an action.
 
+Ctrl+C requests safe cancellation while application work is active; retry exit once recovery completes. SIGTERM/interrupt cancellation waits for the application's bounded recovery, then stops the terminal event loop. Neither path bypasses release-state reconciliation.
+
 The deployment module has no application daemon or metadata database. It uses the repository's existing Podman v6 Go bindings, Git CLI, private connection-scoped JSON and optional host integrations. Podman socket activation/Machine, Nginx and host schedulers are separate platform dependencies, not a Podman-TUI daemon.
 
 ## Start from an image

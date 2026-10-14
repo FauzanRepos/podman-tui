@@ -1,7 +1,9 @@
 package app
 
 import (
-	"os"
+	"context"
+	"sync"
+	"time"
 
 	"github.com/containers/podman-tui/config"
 	"github.com/containers/podman-tui/pdcs/registry"
@@ -175,8 +177,14 @@ func NewApp(name string, version string) *App {
 }
 
 // Run starts the application loop.
-func (app *App) Run() error { //nolint:cyclop
+func (app *App) Run(ctx context.Context) error { //nolint:cyclop
 	log.Info().Msg("app: run")
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stopped := make(chan struct{})
+	defer close(stopped)
+	var watch sync.Once
 
 	flex := tview.NewFlex().
 		SetDirection(tview.FlexRow).
@@ -186,6 +194,24 @@ func (app *App) Run() error { //nolint:cyclop
 	menuWidth := tview.TaggedStringWidth(app.menu.GetText(false))
 	lastWidth := 0
 	app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
+		watch.Do(func() {
+			go func() {
+				select {
+				case <-ctx.Done():
+					tick := time.NewTicker(50 * time.Millisecond)
+					defer tick.Stop()
+					for !app.applications.RequestExit() {
+						select {
+						case <-tick.C:
+						case <-stopped:
+							return
+						}
+					}
+					app.Stop()
+				case <-stopped:
+				}
+			}()
+		})
 		width, _ := screen.Size()
 		if width > 0 && width != lastWidth {
 			flex.ResizeItem(app.menu, (menuWidth+width-1)/width, 0)
@@ -208,7 +234,6 @@ func (app *App) Run() error { //nolint:cyclop
 			}
 			log.Info().Msg("app: stop")
 			app.Stop()
-			os.Exit(0)
 		}
 
 		if !app.frontScreenHasActiveDialog() {
