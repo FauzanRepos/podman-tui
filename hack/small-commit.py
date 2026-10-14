@@ -27,6 +27,7 @@ def main():
     if git("diff", "--cached", "--name-only", "-z"):
         parser.error("index is not empty; inspect existing staged changes first")
     paths = []
+    validated = {}
     suspicious = re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----|(?:ghp_|github_pat_|sk_live_|AKIA)[A-Za-z0-9_]{16,}")
     credential_url = re.compile(rb"https?://[^\s/@]+:[^\s/@]+@[^\s\"'<>\\]+")
     for value in args.files:
@@ -45,19 +46,24 @@ def main():
             if not (p.name.endswith("_test.go") and hostname.endswith(".invalid")):
                 parser.error("credential-bearing URL detected in selected file: " + value)
         paths.append(value)
+        validated[value] = content
     print(git("status", "--short", "--branch").decode(), end="")
     subprocess.run(["git", "diff", "--", *paths], check=True)
     subprocess.run(shlex.split(args.validate), check=True)
     # Another process may have changed the index during validation.
     if git("diff", "--cached", "--name-only", "-z"):
         parser.error("index changed during validation; nothing staged by this helper")
+    if any(Path(path).is_symlink() or Path(path).read_bytes() != content for path, content in validated.items()):
+        parser.error("selected content changed during validation; rerun after reviewing the change")
     subprocess.run(["git", "add", "--", *paths], check=True)
     staged = {p for p in git("diff", "--cached", "--name-only", "-z").decode().split("\0") if p}
     if not staged or not staged.issubset(set(paths)):
         parser.error("staged allowlist mismatch; inspect index")
+    if any(git("show", ":" + path) != validated[path] for path in staged):
+        parser.error("staged content differs from validated content; inspect index")
     subprocess.run(["git", "diff", "--cached", "--check"], check=True)
     subprocess.run(["git", "diff", "--cached", "--stat"], check=True)
-    subprocess.run(["git", "commit", "--signoff", "-m", args.message, "--", *paths], check=True)
+    subprocess.run(["git", "commit", "--signoff", "-m", args.message], check=True)
     print(git("log", "-1", "--format=%H %s").decode(), end="")
 
 

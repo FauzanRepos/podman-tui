@@ -66,6 +66,14 @@ class CommitWorkflowTests(unittest.TestCase):
         self.assertNotEqual(self.invoke(file.name).returncode, 0)
         self.assertEqual(self.git("diff", "--cached", "--name-only"), b"")
 
+    def test_validation_cannot_substitute_unchecked_content(self):
+        (self.root / "selected.txt").write_text("reviewed safe content\n")
+        validation = "python3 -c 'from pathlib import Path; Path(\"selected.txt\").write_text(\"changed after review\")'"
+        result = self.invoke("selected.txt", validation)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.git("diff", "--cached", "--name-only"), b"")
+        self.assertIn("changed during validation", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
