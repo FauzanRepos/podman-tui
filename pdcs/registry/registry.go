@@ -19,6 +19,8 @@ var pdcsRegistry registry
 // service implements podman connection service.
 type registry struct {
 	mu                sync.Mutex
+	connectMu         sync.Mutex
+	generation        uint64
 	connection        Connection
 	connContext       *context.Context
 	connContextCancel func()
@@ -59,6 +61,7 @@ func SetConnection(connection Connection) {
 
 	pdcsRegistry.mu.Lock()
 	defer pdcsRegistry.mu.Unlock()
+	cancelContextLocked()
 
 	pdcsRegistry.connection = connection
 	pdcsRegistry.connectionIsSet = true
@@ -68,10 +71,10 @@ func SetConnection(connection Connection) {
 func UnsetConnection() {
 	log.Debug().Msgf("pdcs: registry unset connection")
 	pdcsRegistry.mu.Lock()
+	defer pdcsRegistry.mu.Unlock()
+	cancelContextLocked()
 	pdcsRegistry.connectionIsSet = false
 	pdcsRegistry.connection = Connection{}
-	pdcsRegistry.mu.Unlock()
-	CancelContext()
 }
 
 // CancelContext run the cancel function for context.
@@ -79,12 +82,16 @@ func CancelContext() {
 	pdcsRegistry.mu.Lock()
 	defer pdcsRegistry.mu.Unlock()
 
+	cancelContextLocked()
+}
+
+func cancelContextLocked() {
+	pdcsRegistry.generation++
 	if pdcsRegistry.connContextCancel != nil {
-		log.Debug().Msgf("pdcs: registry context cancel")
 		pdcsRegistry.connContextCancel()
 	}
-
 	pdcsRegistry.connContext = nil
+	pdcsRegistry.connContextCancel = nil
 }
 
 // ConnectionIsSet returns true if connection is set.

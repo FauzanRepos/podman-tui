@@ -17,6 +17,8 @@ podman-tui platform history web --connection my-host
 
 Metadata-only create/list/inspect/configure/rename/export do not contact the Podman server. `--state-dir` overrides the private metadata root; `PODMAN_TUI_STATE_DIR` selects the root for both CLI and TUI. The default is the OS user configuration directory plus `podman-tui/deploy`; each exact endpoint has its own hashed directory. Do not share this directory across untrusted users or multiple machines with independent filesystem locking.
 
+Transport initialization captures the selected connection generation under a lock. Switching or canceling the connection cancels an unfinished handshake; a completed old-host binding cannot be published into the new selection. Cached TUI bindings must match the selected URI and identity.
+
 For ports, limits, storage or environment configuration, create from a JSON file (`--file path`, or `--file -` for stdin):
 
 ```json

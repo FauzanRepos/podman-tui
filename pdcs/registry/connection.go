@@ -14,47 +14,62 @@ var ErrConnectionNotSelected = errors.New("system connection not selected")
 
 // GetConnection returns connection to podman socket.
 func GetConnection() (context.Context, error) {
-	if !ConnectionIsSet() {
+	// Serialize initializers without blocking endpoint selection during a dial.
+	pdcsRegistry.connectMu.Lock()
+	defer pdcsRegistry.connectMu.Unlock()
+	pdcsRegistry.mu.Lock()
+	if !pdcsRegistry.connectionIsSet {
+		pdcsRegistry.mu.Unlock()
 		return nil, ErrConnectionNotSelected
 	}
-
-	if pdcsRegistry.connContext == nil {
-		var (
-			conn       context.Context
-			err        error
-			passPhrase string
-		)
-
-		dest := ConnectionURI()
-
-		connURI, err := url.Parse(dest)
-		if err != nil {
-			return nil, err
-		}
-
-		if v, found := os.LookupEnv("CONTAINER_PASSPHRASE"); found {
-			passPhrase = v
-		}
-
-		connURI.User = url.UserPassword(connURI.User.String(), passPhrase)
-
-		ctx := context.Background()
-		ctx, cancel := context.WithCancel(ctx)
-
-		conn, err = bindings.NewConnectionWithIdentity(ctx, connURI.String(), ConnectionIdentity(), false)
-		if err != nil {
-			cancel()
-
-			return nil, err
-		}
-
-		pdcsRegistry.connContext = &conn
-		pdcsRegistry.connContextCancel = cancel
-
+	if pdcsRegistry.connContext != nil {
+		conn := *pdcsRegistry.connContext
+		pdcsRegistry.mu.Unlock()
 		return conn, nil
 	}
+	selected, generation := pdcsRegistry.connection, pdcsRegistry.generation
+	ctx, cancel := context.WithCancel(context.Background())
+	pdcsRegistry.connContextCancel = cancel // endpoint changes also cancel an unfinished handshake
+	pdcsRegistry.mu.Unlock()
+	published := false
+	defer func() {
+		if !published {
+			cancel()
+			pdcsRegistry.mu.Lock()
+			if pdcsRegistry.generation == generation {
+				pdcsRegistry.connContextCancel = nil
+			}
+			pdcsRegistry.mu.Unlock()
+		}
+	}()
 
-	return *pdcsRegistry.connContext, nil
+	connURI, err := url.Parse(selected.URI)
+	if err != nil {
+		return nil, err
+	}
+	if connURI.Scheme == "ssh" {
+		passPhrase := os.Getenv("CONTAINER_PASSPHRASE")
+		username := ""
+		if connURI.User != nil {
+			username = connURI.User.Username()
+		}
+		connURI.User = url.UserPassword(username, passPhrase)
+	}
+	conn, err := bindings.NewConnectionWithIdentity(ctx, connURI.String(), selected.Identity, false)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	pdcsRegistry.mu.Lock()
+	defer pdcsRegistry.mu.Unlock()
+	if !pdcsRegistry.connectionIsSet || pdcsRegistry.generation != generation {
+		cancel()
+		return nil, errors.New("Podman connection changed while connecting; retry")
+	}
+	pdcsRegistry.connContext = &conn
+	pdcsRegistry.connContextCancel = cancel
+	published = true
+	return conn, nil
 }
 
 // GetCachedConnection captures a ready binding context without initializing another transport.
