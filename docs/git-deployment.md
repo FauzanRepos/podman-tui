@@ -6,7 +6,7 @@ The platform fetches an explicitly trusted repository with the installed Git CLI
 
 ```sh
 podman-tui platform create web --repository https://github.com/your-team/your-app.git \
-  --revision main --trust-build --connection production
+  --revision main --trust-source --connection production
 podman-tui platform deploy web --connection production
 podman-tui platform history web --connection production
 podman-tui platform redeploy web --connection production
@@ -30,5 +30,53 @@ ssh -o BatchMode=yes -o StrictHostKeyChecking=yes deploy@deployment-host \
 The repository and branch are configured on the host; CI does not send arbitrary shell fragments or repository URLs. For immutable CI releases, configure the reviewed commit SHA before deploying using a trusted host-side JSON update. Do not interpolate untrusted branch names, PR titles or payload fields into remote shell commands.
 
 For GitHub Actions, use a deployment job with a protected environment, a narrowly scoped deployment identity and a `concurrency` group for this host/application. On GitLab CI, use protected deployment variables and `resource_group` for serialization. Both can execute the command above after provisioning known-hosts and an SSH agent through their secret mechanisms. Do not enable SSH host-key bypasses, print secrets, persist credentials in the repository, expose the Podman socket publicly or run untrusted fork jobs with deployment access.
+
+### GitHub Actions example
+
+Use a dedicated trusted self-hosted runner whose administrator has already provisioned a scoped SSH agent and verified known-hosts. Protect the `production` environment and restrict this workflow to the deployment branch. Replace the reserved example host with your owned deployment host; the fixed remote command contains no event-payload interpolation.
+
+```yaml
+name: Deploy configured Git revision
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: ptui-production-web
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: [self-hosted, deployment]
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Redeploy reviewed configured branch
+        run: >-
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes deploy@deploy.example.invalid
+          podman-tui platform redeploy web --connection production --timeout 10m
+```
+
+### GitLab CI example
+
+Use a protected shell runner tagged `deployment`, with the same externally provisioned SSH agent/known-hosts. Protect the production environment and deployment branch. `resource_group` serializes jobs for this application; the host state lock also protects cross-provider writers.
+
+```yaml
+deploy-web:
+  tags: [deployment]
+  resource_group: ptui-production-web
+  environment:
+    name: production
+  timeout: 15m
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    - >-
+      ssh -o BatchMode=yes -o StrictHostKeyChecking=yes deploy@deploy.example.invalid
+      podman-tui platform redeploy web --connection production --timeout 10m
+```
+
+These jobs intentionally deploy the host's configured Git revision, which may have advanced since the triggering event. For exact event-commit deployments, use a reviewed host-side configuration update to an immutable SHA before redeploying. Do not run either job on untrusted forks, share the privileged runner with untrusted jobs, or disable SSH verification. The SSH identity authorizes the deployment account; use a scoped account and audit host access independently.
+
 
 The platform does not register CI provider accounts, secrets or runners for you. These are operator-controlled trust boundaries. No GitHub/GitLab hosted pipeline was executed during local verification.
