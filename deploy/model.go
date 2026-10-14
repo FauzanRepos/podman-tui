@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/distribution/reference"
 )
@@ -23,6 +24,7 @@ const (
 	AppLabel     = "io.podman-tui.application"
 	ReleaseLabel = "io.podman-tui.release"
 	OwnerValue   = "deployment-v1"
+	RoleLabel    = "io.podman-tui.role"
 )
 
 var (
@@ -30,6 +32,8 @@ var (
 	ErrBusy             = errors.New("deployment operation is already active")
 	ErrRecoveryRequired = errors.New("routing or runtime recovery is incomplete; resources preserved for recover-abort")
 	sshRepoPattern      = regexp.MustCompile(`^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[A-Za-z0-9/_.-]+$`)
+	sshUserPattern      = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`)
+	gitHostLabelPattern = regexp.MustCompile(`(?i)^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 	namePattern         = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 	envPattern          = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 	domainLabelPattern  = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
@@ -57,7 +61,9 @@ type Volume struct {
 type SecretRef struct {
 	Name   string `json:"name"`
 	Target string `json:"target"`
-	Type   string `json:"type"` // env or mount; never a secret value
+	Type   string `json:"type"`          // env or mount; never a secret value
+	UID    uint32 `json:"uid,omitempty"` // mount ownership inside the container
+	GID    uint32 `json:"gid,omitempty"`
 }
 
 type RuntimeConfig struct {
@@ -119,6 +125,7 @@ type Release struct {
 	Repository    string      `json:"repository,omitempty"`
 	ImageID       string      `json:"image_id,omitempty"`
 	ContainerID   string      `json:"container_id,omitempty"`
+	ImagePinID    string      `json:"image_pin_id,omitempty"`
 	Endpoint      string      `json:"endpoint,omitempty"`
 	Previous      string      `json:"previous,omitempty"`
 	Health        string      `json:"health,omitempty"`
@@ -145,12 +152,24 @@ type Runtime interface {
 	ResolveImage(context.Context, string, io.Writer) (string, error)
 	Build(context.Context, SourceTree, string, io.Writer) (string, error)
 	Create(context.Context, Application, Release) (Candidate, error)
+	PinImage(context.Context, Application, Release) (string, error)
 	Inspect(context.Context, Application, string) (RuntimeStatus, error)
 	Endpoint(context.Context, Application, string) (string, error)
 	Find(context.Context, Application, string) (Candidate, error)
 	Start(context.Context, Application, string) error
 	Stop(context.Context, Application, string) error
 	Remove(context.Context, Application, string) error
+}
+
+// Supervisor owns optional Linux startup units; live container operations remain with Runtime.
+type Supervisor interface {
+	Installed(Application) (bool, error)
+	Active(context.Context, Application) (bool, error)
+	Control(context.Context, Application, string) error
+	Refresh(context.Context, Application, Release) error
+	Install(context.Context, Application, Release, bool) error
+	Disable(context.Context, Application) error
+	Remove(context.Context, Application) error
 }
 
 type Source interface {
@@ -197,27 +216,60 @@ func ValidateDomain(s string) error {
 }
 
 func ValidateGit(g GitConfig) error {
-	if strings.ContainsAny(g.URL+g.Revision, "\x00\r\n") || strings.HasPrefix(g.Revision, "-") || g.Revision == "" {
-		return errors.New("invalid repository or revision")
+	for _, r := range g.URL + g.Revision {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			return errors.New("repository and revision cannot contain whitespace or controls")
+		}
+	}
+	if g.Revision == "" || strings.HasPrefix(g.Revision, "-") || strings.HasPrefix(g.Revision, "+") || strings.ContainsAny(g.Revision, ":*?[]\\~^") ||
+		strings.Contains(g.Revision, "..") || strings.Contains(g.Revision, "@{") || g.Revision == "@" {
+		return errors.New("revision must name one exact branch, tag or commit")
+	}
+	for _, component := range strings.Split(g.Revision, "/") {
+		if component == "" || strings.HasPrefix(component, ".") || strings.HasSuffix(component, ".") || strings.HasSuffix(component, ".lock") {
+			return errors.New("invalid repository revision")
+		}
 	}
 	if strings.HasPrefix(g.URL, "-") {
 		return errors.New("repository cannot be an option")
 	}
+	validHost := func(host string) bool {
+		if net.ParseIP(host) != nil {
+			return true
+		}
+		if len(host) == 0 || len(host) > 253 {
+			return false
+		}
+		for _, label := range strings.Split(host, ".") {
+			if !gitHostLabelPattern.MatchString(label) {
+				return false
+			}
+		}
+		return true
+	}
 	u, err := url.Parse(g.URL)
-	if err == nil && (u.Scheme == "https" || u.Scheme == "ssh") && u.Host != "" {
-		if u.RawQuery != "" || u.Fragment != "" {
-			return errors.New("repository query strings and fragments are not supported")
+	if err == nil && (u.Scheme == "https" || u.Scheme == "ssh") && validHost(u.Hostname()) {
+		if u.RawQuery != "" || u.Fragment != "" || u.Path == "" || u.Path == "/" {
+			return errors.New("repository requires a path without query strings or fragments")
+		}
+		for _, r := range u.Path {
+			if unicode.IsControl(r) || unicode.IsSpace(r) {
+				return errors.New("unsafe repository path")
+			}
 		}
 		if u.User != nil {
-			if _, present := u.User.Password(); present || u.Scheme == "https" {
-				return errors.New("use SSH or an existing credential helper, not embedded credentials")
+			if _, present := u.User.Password(); present || u.Scheme == "https" || !sshUserPattern.MatchString(u.User.Username()) {
+				return errors.New("use a safe SSH user or existing credential helper, not embedded credentials")
 			}
 		}
 		return nil
 	}
-	// Git's conventional user@host:path form. Do not accept local paths or arbitrary transports.
 	if sshRepoPattern.MatchString(g.URL) {
-		return nil
+		login, location, _ := strings.Cut(g.URL, "@")
+		host, repository, _ := strings.Cut(location, ":")
+		if sshUserPattern.MatchString(login) && validHost(host) && !strings.HasPrefix(repository, "-") {
+			return nil
+		}
 	}
 	return errors.New("repository must use HTTPS or SSH")
 }

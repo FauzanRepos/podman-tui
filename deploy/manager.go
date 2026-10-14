@@ -13,10 +13,12 @@ import (
 )
 
 type Manager struct {
-	Store   *Store
-	Runtime Runtime
-	Source  Source
-	Router  Router
+	Store       *Store
+	Runtime     Runtime
+	Source      Source
+	Router      Router
+	LocalPodman bool // true only for a Unix connection on the controller's Linux host
+	Startup     Supervisor
 }
 type DeployOptions struct {
 	RollbackRelease string
@@ -196,38 +198,116 @@ func (m *Manager) Status(ctx context.Context, name string) (RuntimeStatus, error
 	if i < 0 {
 		return RuntimeStatus{}, ErrNotFound
 	}
-	return m.Runtime.Inspect(ctx, a, s.Releases[i].ContainerID)
+	_, status, err := m.resolveCurrent(ctx, a, s.Releases[i])
+	if errors.Is(err, ErrNotFound) && m.Startup != nil {
+		installed, startupErr := m.Startup.Installed(a)
+		if startupErr != nil {
+			return RuntimeStatus{}, startupErr
+		}
+		if installed {
+			return RuntimeStatus{Running: false, Health: "stopped; inspect the systemd unit for failures", ImageID: s.Releases[i].ImageID}, nil
+		}
+	}
+	return status, err
 }
 
 func (m *Manager) Lifecycle(ctx context.Context, name, action string) error {
+	if action != "start" && action != "stop" && action != "restart" {
+		return errors.New("unsupported lifecycle action")
+	}
 	session, err := m.Store.Begin()
 	if err != nil {
 		return err
 	}
 	defer session.Close()
-	i := appIndex(session.State, name)
-	if i < 0 {
+	ai := appIndex(session.State, name)
+	if ai < 0 {
 		return ErrNotFound
 	}
-	a := session.State.Applications[i]
+	a := session.State.Applications[ai]
 	ri := releaseIndex(session.State, a.CurrentRelease)
 	if ri < 0 {
 		return ErrNotFound
 	}
 	r := session.State.Releases[ri]
-	switch action {
-	case "start":
-		return m.Runtime.Start(ctx, r.Snapshot, r.ContainerID)
-	case "stop":
-		return m.Runtime.Stop(ctx, r.Snapshot, r.ContainerID)
-	case "restart":
-		if err = m.Runtime.Stop(ctx, r.Snapshot, r.ContainerID); err != nil {
+	candidate, _, lookupErr := m.resolveCurrent(ctx, a, r)
+	if lookupErr != nil && !errors.Is(lookupErr, ErrNotFound) {
+		return lookupErr
+	}
+	installed, supervised := false, false
+	if m.Startup != nil {
+		installed, err = m.Startup.Installed(a)
+		if err != nil {
 			return err
 		}
-		return m.Runtime.Start(ctx, r.Snapshot, r.ContainerID)
-	default:
-		return errors.New("unsupported lifecycle action")
+		if installed {
+			supervised, err = m.Startup.Active(ctx, a)
+			if err != nil {
+				return err
+			}
+		}
 	}
+	if supervised || (installed && errors.Is(lookupErr, ErrNotFound)) {
+		if r.ImagePinID == "" {
+			r.ImagePinID, err = m.Runtime.PinImage(ctx, r.Snapshot, r)
+			if err != nil {
+				return err
+			}
+			session.State.Releases[ri] = r
+			if err = session.Save(); err != nil {
+				return err
+			}
+		}
+		if err = m.Startup.Control(ctx, a, action); err != nil {
+			return err
+		}
+		if action == "stop" {
+			return nil
+		}
+		candidate, err = m.Runtime.Find(ctx, a, r.ID)
+		if err != nil {
+			return err
+		}
+	} else {
+		if errors.Is(lookupErr, ErrNotFound) {
+			if action == "stop" {
+				return nil
+			}
+			if _, err = m.Runtime.ResolveImage(ctx, r.ImageID, io.Discard); err != nil {
+				return err
+			}
+			candidate, err = m.Runtime.Create(ctx, r.Snapshot, r)
+			if err != nil {
+				return err
+			}
+		}
+		if action == "stop" {
+			return m.Runtime.Stop(ctx, r.Snapshot, candidate.ID)
+		}
+		if action == "restart" {
+			if err = m.Runtime.Stop(ctx, r.Snapshot, candidate.ID); err != nil {
+				return err
+			}
+		}
+		if err = m.Runtime.Start(ctx, r.Snapshot, candidate.ID); err != nil {
+			return err
+		}
+	}
+	candidate.Endpoint, err = m.Runtime.Endpoint(ctx, r.Snapshot, candidate.ID)
+	if err != nil {
+		return err
+	}
+	if err = m.waitReady(ctx, r.Snapshot, candidate); err != nil {
+		return err
+	}
+	if r.Snapshot.Proxy != nil {
+		if _, err = m.Router.Switch(ctx, r.Snapshot, candidate); err != nil {
+			return err
+		}
+	}
+	r.ContainerID, r.Endpoint = candidate.ID, candidate.Endpoint
+	session.State.Releases[ri] = r
+	return session.Save()
 }
 
 func (m *Manager) Delete(ctx context.Context, name string, confirmed bool) error {
@@ -254,10 +334,32 @@ func (m *Manager) Delete(ctx context.Context, name string, confirmed bool) error
 			return err
 		}
 	}
-	for _, r := range session.State.Releases {
-		if r.ApplicationID == a.ID && r.ContainerID != "" {
-			if err = m.Runtime.Remove(ctx, a, r.ContainerID); err != nil {
+	if m.Startup != nil {
+		installed, startupErr := m.Startup.Installed(a)
+		if startupErr != nil {
+			return startupErr
+		}
+		if installed {
+			if err = m.Startup.Disable(ctx, a); err != nil {
 				return err
+			}
+			if err = m.Startup.Control(ctx, a, "stop"); err != nil {
+				return err
+			}
+			if err = m.Startup.Remove(ctx, a); err != nil {
+				return err
+			}
+		}
+	}
+	for _, release := range session.State.Releases {
+		if release.ApplicationID != a.ID {
+			continue
+		}
+		for _, id := range []string{release.ContainerID, release.ImagePinID} {
+			if id != "" {
+				if err = m.Runtime.Remove(ctx, a, id); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -291,6 +393,35 @@ func (m *Manager) Deploy(ctx context.Context, name string, opts DeployOptions, p
 		copy := session.State.Releases[i]
 		old = &copy
 	}
+	startupInstalled, oldSupervised := false, false
+	oldRunning := false
+	if m.Startup != nil {
+		startupInstalled, err = m.Startup.Installed(a)
+		if err != nil {
+			return Release{}, err
+		}
+		if startupInstalled {
+			oldSupervised, err = m.Startup.Active(ctx, a)
+			if err != nil {
+				return Release{}, err
+			}
+		}
+	}
+	if oldSupervised && opts.Maintenance {
+		return Release{}, errors.New("live Quadlet maintenance cannot retain its container: explicitly stop the application and remove its startup unit before maintenance deployment")
+	}
+	if old != nil {
+		candidate, status, lookupErr := m.resolveCurrent(ctx, old.Snapshot, *old)
+		oldRunning = lookupErr == nil && status.Running
+		if lookupErr != nil && !errors.Is(lookupErr, ErrNotFound) {
+			return Release{}, lookupErr
+		}
+		if errors.Is(lookupErr, ErrNotFound) {
+			old.ContainerID = ""
+		} else {
+			old.ContainerID, old.Endpoint = candidate.ID, candidate.Endpoint
+		}
+	}
 	var rollback *Release
 	if opts.RollbackRelease != "" {
 		i := releaseIndex(session.State, opts.RollbackRelease)
@@ -302,6 +433,21 @@ func (m *Manager) Deploy(ctx context.Context, name string, opts DeployOptions, p
 		a = copy.Snapshot
 		a.Name = desired.Name
 		a.CurrentRelease = desired.CurrentRelease
+		// Certificate renewal is operational state, not application code. Keep a
+		// current certificate when it covers the rollback's domains and route.
+		if a.Proxy != nil && old != nil && old.Snapshot.Proxy != nil {
+			current := old.Snapshot.Proxy
+			covered := current.Certificate != "" && current.PrivateKey != "" &&
+				current.ManagedDir == a.Proxy.ManagedDir && current.ConfigFile == a.Proxy.ConfigFile
+			for _, domain := range a.Domains {
+				covered = covered && slices.Contains(old.Snapshot.Domains, domain)
+			}
+			if covered {
+				proxy := *a.Proxy
+				proxy.Certificate, proxy.PrivateKey = current.Certificate, current.PrivateKey
+				a.Proxy = &proxy
+			}
+		}
 	}
 	if err = a.Validate(); err != nil {
 		return Release{}, err
@@ -312,7 +458,15 @@ func (m *Manager) Deploy(ctx context.Context, name string, opts DeployOptions, p
 	if a.Proxy != nil && m.Router == nil {
 		return Release{}, errors.New("proxy integration is not configured")
 	}
-	if old != nil && !opts.Maintenance {
+	if old != nil && old.Snapshot.Proxy != nil {
+		if m.Router == nil {
+			return Release{}, errors.New("proxy adapter required to change active routing")
+		}
+		if a.Proxy != nil && (a.Proxy.ManagedDir != old.Snapshot.Proxy.ManagedDir || a.Proxy.ConfigFile != old.Snapshot.Proxy.ConfigFile || a.Proxy.Binary != old.Snapshot.Proxy.Binary) {
+			return Release{}, errors.New("detach the active proxy before moving its managed directory, main configuration or binary")
+		}
+	}
+	if old != nil && oldRunning && !opts.Maintenance {
 		for _, p := range a.Config().Ports {
 			if p.Host != 0 {
 				return Release{}, errors.New("fixed host ports require explicitly authorized maintenance deployment")
@@ -350,6 +504,7 @@ func (m *Manager) Deploy(ctx context.Context, name string, opts DeployOptions, p
 	var undo func(context.Context) error
 	oldStopped := false
 	committed := false
+	startupTouched := false
 	// Cancellation must not prevent recovery of a known-good release. Recovery has its own bound.
 	defer func() {
 		if retErr == nil || committed {
@@ -358,6 +513,33 @@ func (m *Manager) Deploy(ctx context.Context, name string, opts DeployOptions, p
 		recovery, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		recoveryFailed := errors.Is(retErr, ErrRecoveryRequired)
+		if startupTouched && old != nil && !recoveryFailed {
+			if restoreErr := m.Startup.Refresh(recovery, old.Snapshot, *old); restoreErr != nil {
+				retErr = errors.Join(retErr, restoreErr, ErrRecoveryRequired)
+				recoveryFailed = true
+			}
+		}
+		if oldStopped && oldSupervised && old != nil && !recoveryFailed {
+			if startErr := m.Startup.Control(recovery, old.Snapshot, "start"); startErr != nil {
+				retErr = errors.Join(retErr, startErr, ErrRecoveryRequired)
+				recoveryFailed = true
+			} else {
+				restored, _, restoreErr := m.resolveCurrent(recovery, old.Snapshot, *old)
+				if restoreErr == nil {
+					restoreErr = m.waitReady(recovery, old.Snapshot, restored)
+				}
+				if restoreErr != nil {
+					retErr = errors.Join(retErr, restoreErr, ErrRecoveryRequired)
+					recoveryFailed = true
+				} else {
+					old.ContainerID, old.Endpoint = restored.ID, restored.Endpoint
+					if index := releaseIndex(session.State, old.ID); index >= 0 {
+						session.State.Releases[index] = *old
+					}
+					oldStopped = false
+				}
+			}
+		}
 		if undo != nil && !recoveryFailed {
 			if undoErr := undo(recovery); undoErr != nil {
 				retErr = errors.Join(retErr, undoErr, ErrRecoveryRequired)
@@ -424,7 +606,7 @@ func (m *Manager) Deploy(ctx context.Context, name string, opts DeployOptions, p
 	if err = saveStage("prepare"); err != nil {
 		return r, err
 	}
-	if old != nil && opts.Maintenance {
+	if old != nil && old.ContainerID != "" && oldRunning && opts.Maintenance {
 		if err = m.Runtime.Stop(ctx, old.Snapshot, old.ContainerID); err != nil {
 			return r, err
 		}
@@ -469,7 +651,44 @@ func (m *Manager) Deploy(ctx context.Context, name string, opts DeployOptions, p
 			return r, err
 		}
 	} else if old != nil && old.Snapshot.Proxy != nil {
-		return r, errors.New("removing active proxy requires an explicit routing removal before deploy")
+		undo = func(recovery context.Context) error {
+			_, restoreErr := m.Router.Switch(recovery, old.Snapshot, Candidate{ID: old.ContainerID, Endpoint: old.Endpoint})
+			return restoreErr
+		}
+		if err = m.Router.Remove(ctx, old.Snapshot); err != nil {
+			return r, err
+		}
+	}
+	if startupInstalled {
+		if old != nil && old.ImagePinID == "" {
+			old.ImagePinID, err = m.Runtime.PinImage(ctx, old.Snapshot, *old)
+			if err != nil {
+				return r, err
+			}
+			if index := releaseIndex(session.State, old.ID); index >= 0 {
+				session.State.Releases[index].ImagePinID = old.ImagePinID
+			}
+		}
+		r.ImagePinID, err = m.Runtime.PinImage(ctx, a, r)
+		if err != nil {
+			return r, err
+		}
+		// daemon-reload changes ExecStop as well as the next ExecStart. Retire
+		// the active old unit using its original definition before replacing it.
+		// The candidate is already ready and routed; image pins permit recovery.
+		if oldSupervised {
+			if err = saveStage("startup-retire"); err != nil {
+				return r, err
+			}
+			oldStopped = true
+			if err = m.Startup.Control(ctx, old.Snapshot, "stop"); err != nil {
+				return r, err
+			}
+		}
+		startupTouched = true
+		if err = m.Startup.Refresh(ctx, a, r); err != nil {
+			return r, err
+		}
 	}
 	if err = saveStage("commit"); err != nil {
 		return r, err
@@ -488,8 +707,13 @@ func (m *Manager) Deploy(ctx context.Context, name string, opts DeployOptions, p
 		progress(Event{Stage: "successful", Message: "release committed; retiring previous container"})
 	}
 	// Retirement is post-commit; failure must not roll back a healthy committed release.
-	if old != nil && !oldStopped {
-		if err = m.Runtime.Stop(ctx, old.Snapshot, old.ContainerID); err != nil {
+	if old != nil && !oldStopped && old.ContainerID != "" {
+		if oldSupervised {
+			err = m.Startup.Control(ctx, a, "stop")
+		} else {
+			err = m.Runtime.Stop(ctx, old.Snapshot, old.ContainerID)
+		}
+		if err != nil {
 			return r, fmt.Errorf("release deployed; previous container retirement failed: %w", err)
 		}
 	}
@@ -578,18 +802,26 @@ func (m *Manager) Cleanup(ctx context.Context, name string, confirmed bool) erro
 		if r.Status == "successful" {
 			retained++
 		}
-		if r.ID == a.CurrentRelease || r.Status == "deploying" || r.ContainerID == "" || (r.Status == "successful" && retained <= keep) {
+		if r.ID == a.CurrentRelease || r.Status == "deploying" || (r.Status == "successful" && retained <= keep) {
 			continue
 		}
-		status, e := m.Runtime.Inspect(ctx, a, r.ContainerID)
-		if e != nil {
-			return e
+		if r.ContainerID != "" {
+			status, inspectErr := m.Runtime.Inspect(ctx, a, r.ContainerID)
+			if inspectErr != nil && !errors.Is(inspectErr, ErrNotFound) {
+				return inspectErr
+			}
+			if inspectErr == nil && status.Running {
+				continue
+			}
+			if err = m.Runtime.Remove(ctx, a, r.ContainerID); err != nil {
+				return err
+			}
 		}
-		if status.Running {
-			continue
-		}
-		if e = m.Runtime.Remove(ctx, a, r.ContainerID); e != nil {
-			return e
+		if r.ImagePinID != "" {
+			if err = m.Runtime.Remove(ctx, a, r.ImagePinID); err != nil {
+				return err
+			}
+			r.ImagePinID = ""
 		}
 		r.ContainerID = ""
 		r.Status = "retired"

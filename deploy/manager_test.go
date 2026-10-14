@@ -11,9 +11,10 @@ import (
 )
 
 type fakeRuntime struct {
-	fail    bool
-	removed []string
-	running map[string]bool
+	fail     bool
+	failedID string
+	removed  []string
+	running  map[string]bool
 }
 
 func (f *fakeRuntime) ResolveImage(context.Context, string, io.Writer) (string, error) {
@@ -23,16 +24,25 @@ func (f *fakeRuntime) Build(context.Context, SourceTree, string, io.Writer) (str
 	return "sha256:built", nil
 }
 func (f *fakeRuntime) Create(_ context.Context, _ Application, r Release) (Candidate, error) {
+	if f.fail {
+		f.failedID = r.ID
+	}
 	return Candidate{ID: r.ID}, nil
+}
+func (f *fakeRuntime) PinImage(_ context.Context, _ Application, r Release) (string, error) {
+	return "hold-" + r.ID, nil
 }
 func (f *fakeRuntime) Endpoint(context.Context, Application, string) (string, error) {
 	return "", nil
 }
-func (f *fakeRuntime) Find(context.Context, Application, string) (Candidate, error) {
+func (f *fakeRuntime) Find(_ context.Context, _ Application, id string) (Candidate, error) {
+	if _, exists := f.running[id]; exists {
+		return Candidate{ID: id}, nil
+	}
 	return Candidate{}, ErrNotFound
 }
 func (f *fakeRuntime) Inspect(_ context.Context, _ Application, id string) (RuntimeStatus, error) {
-	if f.fail {
+	if f.fail && id == f.failedID {
 		return RuntimeStatus{}, errors.New("candidate failure")
 	}
 	return RuntimeStatus{Running: f.running[id], Health: "healthy"}, nil

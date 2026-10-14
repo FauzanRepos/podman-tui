@@ -3,10 +3,11 @@ package deploy
 import (
 	"context"
 	"errors"
+	"io"
 )
 
-// RecoverAbort restores the committed route/container before removing an interrupted candidate.
-// It never assumes an in-progress journal entry reached readiness or routing activation.
+// RecoverAbort explicitly restores the committed image/configuration before retiring an interrupted release.
+// Exclusive writers or a missing previous container can require maintenance downtime; volumes are never removed.
 func (m *Manager) RecoverAbort(ctx context.Context, name string, confirmed bool) error {
 	if !confirmed {
 		return errors.New("interrupted deployment recovery requires confirmation")
@@ -22,50 +23,105 @@ func (m *Manager) RecoverAbort(ctx context.Context, name string, confirmed bool)
 	}
 	a := session.State.Applications[ai]
 	for i := range session.State.Releases {
-		r := &session.State.Releases[i]
-		if r.ApplicationID != a.ID || r.Status != "deploying" {
+		pending := &session.State.Releases[i]
+		if pending.ApplicationID != a.ID || pending.Status != "deploying" {
 			continue
 		}
-		previous := releaseIndex(session.State, r.Previous)
-		if previous >= 0 {
-			old := session.State.Releases[previous]
-			if err = m.Runtime.Start(ctx, old.Snapshot, old.ContainerID); err != nil {
+		candidate, findErr := m.Runtime.Find(ctx, pending.Snapshot, pending.ID)
+		if findErr != nil && !errors.Is(findErr, ErrNotFound) {
+			return findErr
+		}
+		previousIndex := releaseIndex(session.State, pending.Previous)
+		if previousIndex >= 0 {
+			old := session.State.Releases[previousIndex]
+			previous, status, lookupErr := m.resolveCurrent(ctx, old.Snapshot, old)
+			if lookupErr != nil && !errors.Is(lookupErr, ErrNotFound) {
+				return lookupErr
+			}
+			// Stop/remove the interrupted writer before starting a stopped or recreated predecessor.
+			if (lookupErr != nil || !status.Running) && findErr == nil {
+				if m.Startup != nil {
+					active, e := m.Startup.Active(ctx, a)
+					if e != nil {
+						return e
+					}
+					if active {
+						if e = m.Startup.Control(ctx, a, "stop"); e != nil {
+							return e
+						}
+					}
+				}
+				if err = m.Runtime.Remove(ctx, pending.Snapshot, candidate.ID); err != nil {
+					return err
+				}
+				findErr = ErrNotFound
+			}
+			installed := false
+			if m.Startup != nil {
+				installed, err = m.Startup.Installed(a)
+				if err != nil {
+					return err
+				}
+				if installed {
+					if err = m.Startup.Refresh(ctx, old.Snapshot, old); err != nil {
+						return err
+					}
+				}
+			}
+			if errors.Is(lookupErr, ErrNotFound) {
+				if installed {
+					if err = m.Startup.Control(ctx, a, "start"); err != nil {
+						return err
+					}
+					previous, err = m.Runtime.Find(ctx, old.Snapshot, old.ID)
+				} else {
+					if _, err = m.Runtime.ResolveImage(ctx, old.ImageID, io.Discard); err != nil {
+						return err
+					}
+					previous, err = m.Runtime.Create(ctx, old.Snapshot, old)
+				}
+				if err != nil {
+					return err
+				}
+			}
+			if err = m.Runtime.Start(ctx, old.Snapshot, previous.ID); err != nil {
+				return err
+			}
+			previous.Endpoint, err = m.Runtime.Endpoint(ctx, old.Snapshot, previous.ID)
+			if err != nil {
+				return err
+			}
+			if err = m.waitReady(ctx, old.Snapshot, previous); err != nil {
 				return err
 			}
 			if old.Snapshot.Proxy != nil {
 				if m.Router == nil {
 					return errors.New("proxy adapter required for recovery")
 				}
-				endpoint, e := m.Runtime.Endpoint(ctx, old.Snapshot, old.ContainerID)
-				if e != nil {
-					return e
-				}
-				if _, e = m.Router.Switch(ctx, old.Snapshot, Candidate{ID: old.ContainerID, Endpoint: endpoint}); e != nil {
-					return e
+				if _, err = m.Router.Switch(ctx, old.Snapshot, previous); err != nil {
+					return err
 				}
 			}
-		} else if r.Snapshot.Proxy != nil {
+			session.State.Releases[previousIndex].ContainerID = previous.ID
+			session.State.Releases[previousIndex].Endpoint = previous.Endpoint
+		} else if pending.Snapshot.Proxy != nil {
 			if m.Router == nil {
 				return errors.New("proxy adapter required for recovery")
 			}
-			if err = m.Router.Remove(ctx, r.Snapshot); err != nil {
+			if err = m.Router.Remove(ctx, pending.Snapshot); err != nil {
 				return err
 			}
 		}
-		candidate, e := m.Runtime.Find(ctx, r.Snapshot, r.ID)
-		if e != nil && !errors.Is(e, ErrNotFound) {
-			return e
-		}
-		if e == nil {
-			if err = m.Runtime.Remove(ctx, r.Snapshot, candidate.ID); err != nil {
+		if findErr == nil {
+			if err = m.Runtime.Remove(ctx, pending.Snapshot, candidate.ID); err != nil {
 				return err
 			}
-			r.ContainerID = candidate.ID
+			pending.ContainerID = candidate.ID
 		}
-		r.Status = "failed"
-		r.Stage = "recovered"
-		r.Health = "interrupted"
-		r.Error = "interrupted candidate aborted; previous committed release restored"
+		pending.Status = "failed"
+		pending.Stage = "recovered"
+		pending.Health = "interrupted"
+		pending.Error = "interrupted candidate aborted; previous committed release restored"
 	}
 	return session.Save()
 }
