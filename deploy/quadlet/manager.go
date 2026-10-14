@@ -7,10 +7,13 @@
 package quadlet
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -50,6 +53,8 @@ type Manager struct {
 	generators             []string
 	systemctl              string
 	run                    runner
+	// transactionStep is an interruption seam used by crash-recovery tests.
+	transactionStep func(string, int)
 }
 
 // New does not probe the host or modify files. local must describe the actual
@@ -163,11 +168,6 @@ func quote(s string) string {
 	return "\"" + s + "\""
 }
 
-// EnvironmentFile has its own grammar and does not expand percent specifiers.
-func envQuote(s string) string {
-	return "\"" + strings.NewReplacer("\\", "\\\\", "\"", "\\\"").Replace(s) + "\""
-}
-
 type metadata struct {
 	Version     int
 	Application deploy.Application
@@ -179,6 +179,12 @@ func (m *Manager) names(id string) (string, string, string) {
 	private := filepath.Join(m.dir, ".ptui-quadlet")
 	return filepath.Join(m.dir, "ptui-"+id+".container"),
 		filepath.Join(private, id+".env"), filepath.Join(private, id+".json")
+}
+
+// The stable environment remains for compatibility, but boot-visible units use
+// immutable bytes so an interrupted replacement cannot pair releases and envs.
+func environmentGeneration(stable string, data []byte) string {
+	return strings.TrimSuffix(stable, ".env") + fmt.Sprintf(".%x.env", sha256.Sum256(data))
 }
 
 func render(a deploy.Application, r deploy.Release, enabled, rootless bool, envPath string) ([]byte, []byte, error) {
@@ -230,7 +236,7 @@ func render(a deploy.Application, r deploy.Release, enabled, rootless bool, envP
 	directive("Label", deploy.RoleLabel+"=runtime")
 	directive("PodmanArgs", "--security-opt=no-new-privileges")
 	directive("ImageVolume", "ignore")
-	directive("EnvironmentFile", envPath)
+	// Publish EnvironmentFile only after its content-addressed path is known.
 	env.WriteString(marker + a.ID + "\n")
 	keys := make([]string, 0, len(cfg.Env))
 	for key := range cfg.Env {
@@ -241,8 +247,12 @@ func render(a deploy.Application, r deploy.Release, enabled, rootless bool, envP
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		env.WriteString(key + "=" + envQuote(cfg.Env[key]) + "\n")
+		// [Container] EnvironmentFile is passed to Podman's --env-file parser,
+		// which preserves values literally rather than unquoting shell syntax.
+		env.WriteString(key + "=" + cfg.Env[key] + "\n")
 	}
+	envData := []byte(env.String())
+	directive("EnvironmentFile", environmentGeneration(envPath, envData))
 	for _, s := range cfg.Secrets {
 		if !secretPattern.MatchString(s.Name) {
 			return nil, nil, errors.New("invalid secret name")
@@ -353,10 +363,19 @@ func render(a deploy.Application, r deploy.Release, enabled, rootless bool, envP
 		}
 		unit.WriteString("\n[Install]\nWantedBy=" + target + "\n")
 	}
-	return []byte(unit.String()), []byte(env.String()), nil
+	return []byte(unit.String()), envData, nil
 }
 
 func directory(path string, mode os.FileMode, private bool) error {
+	var created []string
+	for parent := path; ; parent = filepath.Dir(parent) {
+		if _, err := os.Lstat(parent); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		created = append(created, parent)
+	}
 	if err := os.MkdirAll(path, mode); err != nil {
 		return err
 	}
@@ -367,8 +386,16 @@ func directory(path string, mode os.FileMode, private bool) error {
 	if !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("unsafe directory %s", path)
 	}
-	if private && fi.Mode().Perm() != 0700 {
-		return fmt.Errorf("directory %s must have mode 0700", path)
+	if private && (fi.Mode().Perm() != 0700 || !ownedByProcess(fi)) {
+		return fmt.Errorf("directory %s must be owned by this user with mode 0700", path)
+	}
+	for _, dir := range created {
+		if err := syncDirectory(dir); err != nil {
+			return err
+		}
+		if err := syncDirectory(filepath.Dir(dir)); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -376,6 +403,15 @@ func directory(path string, mode os.FileMode, private bool) error {
 func (m *Manager) lock(ctx context.Context) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if m.configErr != nil {
+		return nil, m.configErr
+	}
+	if err := cleanValue(m.dir); err != nil {
+		return nil, err
+	}
+	if !filepath.IsAbs(m.dir) {
+		return nil, errors.New("Quadlet directory must be absolute")
 	}
 	if err := directory(m.dir, 0755, false); err != nil {
 		return nil, err
@@ -395,6 +431,24 @@ func (m *Manager) lock(ctx context.Context) (func(), error) {
 	return func() { _ = session.Close() }, nil
 }
 
+func (m *Manager) lockRecovered(ctx context.Context, ctl string) (func(), error) {
+	unlock, err := m.lock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			unlock()
+		}
+	}()
+	if err := m.recoverTransaction(ctl); err != nil {
+		return nil, fmt.Errorf("Quadlet transaction recovery: %w", err)
+	}
+	handedOff = true
+	return unlock, nil
+}
+
 type savedFile struct {
 	path   string
 	data   []byte
@@ -402,6 +456,10 @@ type savedFile struct {
 }
 
 func readPrivate(path string) ([]byte, bool, error) {
+	return readPrivateBounded(path, maxQuadletFile)
+}
+
+func readPrivateBounded(path string, maxSize int64) ([]byte, bool, error) {
 	fi, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, false, nil
@@ -409,10 +467,28 @@ func readPrivate(path string) ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	if !fi.Mode().IsRegular() || fi.Mode().Perm() != 0600 {
-		return nil, false, fmt.Errorf("unsafe file %s: expected regular mode 0600", path)
+	if !fi.Mode().IsRegular() || fi.Mode().Perm() != 0600 || !ownedByProcess(fi) {
+		return nil, false, fmt.Errorf("unsafe file %s: expected user-owned regular mode 0600", path)
 	}
-	data, err := os.ReadFile(path)
+	if fi.Size() > maxSize {
+		return nil, false, fmt.Errorf("Quadlet file %s exceeds size limit", path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close()
+	actual, err := f.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	if !os.SameFile(fi, actual) || !actual.Mode().IsRegular() || actual.Mode().Perm() != 0600 || !ownedByProcess(actual) {
+		return nil, false, fmt.Errorf("Quadlet file %s changed while opening", path)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxSize+1))
+	if err == nil && int64(len(data)) > maxSize {
+		err = fmt.Errorf("Quadlet file %s exceeds size limit", path)
+	}
 	return data, true, err
 }
 
@@ -442,10 +518,15 @@ func (m *Manager) snapshot(id string) ([]savedFile, *metadata, error) {
 			return nil, nil, fmt.Errorf("unmanaged Quadlet file %s", files[i].path)
 		}
 	}
-	// Partial state is not adopted: all managed files are written together.
+	// Partial state without a recoverable journal must never be adopted.
 	if (files[0].exists || files[1].exists || files[2].exists) &&
 		!(files[0].exists && files[1].exists && files[2].exists) {
 		return nil, nil, errors.New("incomplete Quadlet state; refusing to adopt files")
+	}
+	if files[2].exists {
+		if err := m.checkEnvironment(id, files[0].data, files[2].data); err != nil {
+			return nil, nil, err
+		}
 	}
 	return files, md, nil
 }
@@ -469,7 +550,10 @@ func atomicWrite(path string, data []byte) (err error) {
 	if err = f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(name, path)
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(path))
 }
 
 func (m *Manager) ctl(ctx context.Context, ctl string, args ...string) ([]byte, error) {
@@ -514,56 +598,336 @@ func (m *Manager) preflight(ctx context.Context, generator, id string, unit []by
 	return nil
 }
 
-// commit restores all previous owned files on write/reload failure. Recovery is
-// deliberately independent of the caller's canceled context and time bounded.
-func (m *Manager) commit(ctx context.Context, ctl string, before []savedFile, after [][]byte, remove bool) error {
-	var failure error
-	for i, old := range before {
-		if err := ctx.Err(); err != nil {
-			failure = err
-			break
+// A single journal suffices because all operations share the cross-process lock.
+// Paths are derived from the validated ID, never supplied by journal contents.
+const maxQuadletFile = 4 << 20
+const maxQuadletJournal = 40 << 20
+
+type journalFile struct {
+	Data   []byte
+	Exists bool
+}
+
+type transactionJournal struct {
+	Version int
+	ID      string
+	Before  [3]journalFile
+	After   [3]journalFile
+}
+
+func (m *Manager) journalPath() string {
+	return filepath.Join(m.dir, ".ptui-quadlet", "transaction.json")
+}
+
+func syncDirectory(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
+func durableRemove(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncDirectory(filepath.Dir(path))
+}
+
+func (m *Manager) step(stage string, index int) {
+	if m.transactionStep != nil {
+		m.transactionStep(stage, index)
+	}
+}
+
+func validateGeneration(id string, files [3]journalFile) error {
+	exists := files[0].Exists
+	for _, file := range files {
+		if len(file.Data) > maxQuadletFile || file.Exists != exists || (!file.Exists && len(file.Data) != 0) {
+			return errors.New("invalid Quadlet journal generation")
 		}
-		var err error
-		if remove {
-			if old.exists {
-				err = os.Remove(old.path)
+	}
+	if !exists {
+		return nil
+	}
+	for _, index := range []int{0, 2} {
+		if !bytes.HasPrefix(files[index].Data, []byte(marker+id+"\n")) {
+			return errors.New("unowned Quadlet journal generation")
+		}
+	}
+	var md metadata
+	if err := json.Unmarshal(files[1].Data, &md); err != nil {
+		return fmt.Errorf("invalid Quadlet journal metadata: %w", err)
+	}
+	if md.Version != 1 || md.Application.ID != id {
+		return errors.New("unowned Quadlet journal metadata")
+	}
+	return nil
+}
+
+func (m *Manager) readJournal() (*transactionJournal, error) {
+	data, exists, err := readPrivateBounded(m.journalPath(), maxQuadletJournal)
+	if err != nil || !exists {
+		return nil, err
+	}
+	var journal transactionJournal
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&journal); err != nil {
+		return nil, fmt.Errorf("invalid Quadlet transaction journal: %w", err)
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return nil, errors.New("trailing Quadlet transaction journal data")
+	}
+	if journal.Version != 1 || !idPattern.MatchString(journal.ID) {
+		return nil, errors.New("invalid Quadlet transaction identity")
+	}
+	for _, files := range [][3]journalFile{journal.Before, journal.After} {
+		if err := validateGeneration(journal.ID, files); err != nil {
+			return nil, err
+		}
+	}
+	return &journal, nil
+}
+
+func journalMatches(data []byte, exists bool, file journalFile) bool {
+	return exists == file.Exists && bytes.Equal(data, file.Data)
+}
+
+func (m *Manager) transactionPaths(id string) [3]string {
+	unit, env, meta := m.names(id)
+	return [3]string{env, meta, unit}
+}
+
+func (m *Manager) checkEnvironment(id string, env, unit []byte) error {
+	_, stable, _ := m.names(id)
+	generation := environmentGeneration(stable, env)
+	wantStable := "EnvironmentFile=" + quote(stable)
+	wantGeneration := "EnvironmentFile=" + quote(generation)
+	found := false
+	for len(unit) != 0 {
+		line, rest, _ := bytes.Cut(unit, []byte("\n"))
+		unit = rest
+		if !bytes.HasPrefix(line, []byte("EnvironmentFile=")) {
+			continue
+		}
+		if found || (string(line) != wantStable && string(line) != wantGeneration) {
+			return errors.New("unowned Quadlet environment reference")
+		}
+		found = true
+		if string(line) == wantGeneration {
+			data, exists, err := readPrivate(generation)
+			if err != nil {
+				return err
 			}
+			if !exists || !bytes.Equal(data, env) {
+				return errors.New("missing or changed immutable Quadlet environment")
+			}
+		}
+	}
+	if !found {
+		return errors.New("missing Quadlet environment reference")
+	}
+	return nil
+}
+
+func (m *Manager) prepareEnvironment(id string, env []byte) error {
+	_, stable, _ := m.names(id)
+	path := environmentGeneration(stable, env)
+	data, exists, err := readPrivate(path)
+	if err != nil {
+		return err
+	}
+	if exists {
+		if !bytes.Equal(data, env) {
+			return errors.New("unmanaged immutable Quadlet environment")
+		}
+		return nil
+	}
+	return atomicWrite(path, env)
+}
+
+// Only remove the obsolete generation after both the unit and journal no longer
+// reference it. A foreign/replaced path is deliberately left untouched.
+func (m *Manager) cleanupEnvironment(id string, obsolete, keep journalFile) error {
+	if !obsolete.Exists || (keep.Exists && bytes.Equal(obsolete.Data, keep.Data)) {
+		return nil
+	}
+	_, stable, _ := m.names(id)
+	path := environmentGeneration(stable, obsolete.Data)
+	data, exists, err := readPrivate(path)
+	if err != nil || !exists || !bytes.Equal(data, obsolete.Data) {
+		return nil
+	}
+	return durableRemove(path)
+}
+
+func (m *Manager) checkTransactionPath(path string, journal *transactionJournal, index int) error {
+	data, exists, err := readPrivate(path)
+	if err != nil {
+		return err
+	}
+	if !journalMatches(data, exists, journal.Before[index]) && !journalMatches(data, exists, journal.After[index]) {
+		return fmt.Errorf("unmanaged or changed Quadlet transaction target %s", path)
+	}
+	return nil
+}
+
+// recoverTransaction always rolls back an interrupted operation. The journal is
+// kept until every before-file and the daemon reload are durable/successful, so
+// a second crash during recovery can safely repeat the same rollback.
+func (m *Manager) recoverTransaction(ctl string) error {
+	journal, err := m.readJournal()
+	if err != nil || journal == nil {
+		return err
+	}
+	if ctl == "" {
+		ctl, _, err = m.probe()
+		if err != nil {
+			return err
+		}
+	}
+	paths := m.transactionPaths(journal.ID)
+	// Validate all targets before touching any of them, including partial installs.
+	for index, path := range paths {
+		if err := m.checkTransactionPath(path, journal, index); err != nil {
+			return err
+		}
+	}
+	if journal.Before[2].Exists {
+		if err := m.checkEnvironment(journal.ID, journal.Before[0].Data, journal.Before[2].Data); err != nil {
+			return err
+		}
+	}
+	// The after-generation need only exist when its unit was published. Failed
+	// preparation must still be able to roll back without adopting its target.
+	currentUnit, unitExists, err := readPrivate(paths[2])
+	if err != nil {
+		return err
+	}
+	if unitExists && journal.After[2].Exists && bytes.Equal(currentUnit, journal.After[2].Data) {
+		if err := m.checkEnvironment(journal.ID, journal.After[0].Data, currentUnit); err != nil {
+			return err
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for index, path := range paths {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := m.checkTransactionPath(path, journal, index); err != nil {
+			return err
+		}
+		old := journal.Before[index]
+		if old.Exists {
+			err = atomicWrite(path, old.Data)
 		} else {
-			err = atomicWrite(old.path, after[i])
+			err = durableRemove(path)
 		}
 		if err != nil {
-			failure = err
+			return err
+		}
+		m.step("recovery", index+1)
+	}
+	if _, err := m.ctl(ctx, ctl, "daemon-reload"); err != nil {
+		return err
+	}
+	m.step("recovery-reload", 0)
+	if err := durableRemove(m.journalPath()); err != nil {
+		return err
+	}
+	return m.cleanupEnvironment(journal.ID, journal.After[0], journal.Before[0])
+}
+
+// commit durably records both known generations before the first file change.
+// No runtime action is used, particularly no ExecStop against a replaced unit.
+func (m *Manager) commit(ctx context.Context, ctl string, before []savedFile, after [][]byte, remove bool) error {
+	if len(before) != 3 || (!remove && len(after) != 3) {
+		return errors.New("invalid Quadlet transaction files")
+	}
+	id := strings.TrimSuffix(filepath.Base(before[1].path), ".json")
+	if !idPattern.MatchString(id) {
+		return errors.New("invalid Quadlet transaction identity")
+	}
+	journal := transactionJournal{Version: 1, ID: id}
+	paths := m.transactionPaths(id)
+	for index, old := range before {
+		if old.path != paths[index] {
+			return errors.New("invalid Quadlet transaction path")
+		}
+		journal.Before[index] = journalFile{Data: old.data, Exists: old.exists}
+		if !remove {
+			journal.After[index] = journalFile{Data: after[index], Exists: true}
+		}
+	}
+	for _, files := range [][3]journalFile{journal.Before, journal.After} {
+		if err := validateGeneration(id, files); err != nil {
+			return err
+		}
+	}
+	if _, exists, err := readPrivateBounded(m.journalPath(), maxQuadletJournal); err != nil {
+		return err
+	} else if exists {
+		return errors.New("Quadlet transaction recovery required")
+	}
+	data, err := json.Marshal(journal)
+	if err != nil {
+		return err
+	}
+	if len(data) > maxQuadletJournal {
+		return errors.New("Quadlet transaction journal too large")
+	}
+	if err := atomicWrite(m.journalPath(), data); err != nil {
+		return err
+	}
+	m.step("journal", 0)
+	if !remove {
+		if err := m.prepareEnvironment(id, after[0]); err != nil {
+			if recoveryErr := m.recoverTransaction(ctl); recoveryErr != nil {
+				return fmt.Errorf("Quadlet environment preparation failed: %w; rollback: %v", err, recoveryErr)
+			}
+			return err
+		}
+	}
+	m.step("commit", 0)
+	var failure error
+	// Migrate legacy stable-env units before changing the compatibility env.
+	// Removal unpublishes the unit before deleting any referenced stable file.
+	order := [3]int{1, 2, 0}
+	if remove {
+		order = [3]int{2, 1, 0}
+	}
+	for boundary, index := range order {
+		path := paths[index]
+		if failure = ctx.Err(); failure != nil {
 			break
 		}
+		if failure = m.checkTransactionPath(path, &journal, index); failure != nil {
+			break
+		}
+		if remove {
+			failure = durableRemove(path)
+		} else {
+			failure = atomicWrite(path, after[index])
+		}
+		if failure != nil {
+			break
+		}
+		m.step("commit", boundary+1)
 	}
 	if failure == nil {
 		_, failure = m.ctl(ctx, ctl, "daemon-reload")
 	}
 	if failure == nil {
-		return nil
-	}
-	var recovery []string
-	for _, old := range before {
-		var err error
-		if old.exists {
-			err = atomicWrite(old.path, old.data)
-		} else {
-			err = os.Remove(old.path)
-			if errors.Is(err, os.ErrNotExist) {
-				err = nil
-			}
+		if err := durableRemove(m.journalPath()); err != nil {
+			return err
 		}
-		if err != nil {
-			recovery = append(recovery, err.Error())
-		}
+		return m.cleanupEnvironment(id, journal.Before[0], journal.After[0])
 	}
-	recoveryCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if _, err := m.ctl(recoveryCtx, ctl, "daemon-reload"); err != nil {
-		recovery = append(recovery, err.Error())
-	}
-	if len(recovery) != 0 {
-		return fmt.Errorf("Quadlet update failed: %w; rollback: %s", failure, strings.Join(recovery, "; "))
+	if err := m.recoverTransaction(ctl); err != nil {
+		return fmt.Errorf("Quadlet update failed: %w; rollback: %v", failure, err)
 	}
 	return fmt.Errorf("Quadlet update rolled back: %w", failure)
 }
@@ -576,6 +940,15 @@ func (m *Manager) Install(ctx context.Context, a deploy.Application, r deploy.Re
 	if err != nil {
 		return err
 	}
+	unlock, err := m.lockRecovered(ctx, ctl)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return m.installLocked(ctx, ctl, generator, a, r, enabled)
+}
+
+func (m *Manager) installLocked(ctx context.Context, ctl, generator string, a deploy.Application, r deploy.Release, enabled bool) error {
 	if err := a.Validate(); err != nil {
 		return err
 	}
@@ -584,11 +957,6 @@ func (m *Manager) Install(ctx context.Context, a deploy.Application, r deploy.Re
 	if err != nil {
 		return err
 	}
-	unlock, err := m.lock(ctx)
-	if err != nil {
-		return err
-	}
-	defer unlock()
 	before, _, err := m.snapshot(a.ID)
 	if err != nil {
 		return err
@@ -613,7 +981,7 @@ func (m *Manager) Status(ctx context.Context, a deploy.Application) (string, err
 	if err := appID(a); err != nil {
 		return "", err
 	}
-	unlock, err := m.lock(ctx)
+	unlock, err := m.lockRecovered(ctx, ctl)
 	if err != nil {
 		return "", err
 	}
@@ -639,7 +1007,7 @@ func (m *Manager) Disable(ctx context.Context, a deploy.Application) error {
 	if err := appID(a); err != nil {
 		return err
 	}
-	unlock, err := m.lock(ctx)
+	unlock, err := m.lockRecovered(ctx, ctl)
 	if err != nil {
 		return err
 	}
@@ -677,7 +1045,7 @@ func (m *Manager) Remove(ctx context.Context, a deploy.Application) error {
 	if err := appID(a); err != nil {
 		return err
 	}
-	unlock, err := m.lock(ctx)
+	unlock, err := m.lockRecovered(ctx, ctl)
 	if err != nil {
 		return err
 	}

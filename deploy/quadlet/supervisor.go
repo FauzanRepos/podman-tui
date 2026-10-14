@@ -15,6 +15,11 @@ func (m *Manager) Installed(a deploy.Application) (bool, error) {
 	if err := appID(a); err != nil {
 		return false, err
 	}
+	unlock, err := m.lockRecovered(context.Background(), "")
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
 	_, metadata, err := m.snapshot(a.ID)
 	return metadata != nil, err
 }
@@ -46,7 +51,7 @@ func (m *Manager) Control(ctx context.Context, a deploy.Application, action stri
 	if err = appID(a); err != nil {
 		return err
 	}
-	unlock, err := m.lock(ctx)
+	unlock, err := m.lockRecovered(ctx, ctl)
 	if err != nil {
 		return err
 	}
@@ -63,11 +68,21 @@ func (m *Manager) Control(ctx context.Context, a deploy.Application, action stri
 }
 
 // Refresh preserves the operator's boot enablement while replacing the pinned release definition.
-// daemon-reload does not restart an active service; the deployment manager retires it only after commit.
+// The deployment manager stops the old unchanged unit before Refresh; this
+// method only reloads definitions and never invokes ExecStop on the replacement.
 func (m *Manager) Refresh(ctx context.Context, a deploy.Application, r deploy.Release) error {
+	ctl, generator, err := m.probe()
+	if err != nil {
+		return err
+	}
 	if err := appID(a); err != nil {
 		return err
 	}
+	unlock, err := m.lockRecovered(ctx, ctl)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	_, metadata, err := m.snapshot(a.ID)
 	if err != nil {
 		return err
@@ -75,7 +90,7 @@ func (m *Manager) Refresh(ctx context.Context, a deploy.Application, r deploy.Re
 	if metadata == nil {
 		return nil
 	}
-	return m.Install(ctx, a, r, metadata.Enabled)
+	return m.installLocked(ctx, ctl, generator, a, r, metadata.Enabled)
 }
 
 var _ deploy.Supervisor = (*Manager)(nil)
