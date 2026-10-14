@@ -24,6 +24,26 @@ Terminal user interface for Podman environment.
 podman-tui is a terminal user interface for podman environment.
 It is using [podman go bindings](https://github.com/podman-container-tools/podman/blob/v6.0.0/pkg/bindings/README.md) to communicate with local or remote podman machine (through SSH).
 
+The v2.1.0 development branch adds connection-scoped managed applications,
+checked image/Git releases, rollback and optional host integrations without a
+platform daemon or metadata database. Start with the [deployment guide](platform.md)
+and [architecture, baseline and release gates](deployment-design.md).
+This is development functionality, not an assertion that v2.1.0 is released.
+
+Deployment documentation:
+
+- [Applications, configuration, lifecycle and rollback tutorial](platform.md)
+- [Git deployment and external GitHub/GitLab CI](git-deployment.md)
+- [Managed Nginx, HTTPS, certificate renewal and topology](nginx-https.md)
+- [Rootless Linux, Podman Machine and optional Quadlet](rootless-quadlet.md)
+- [Persistent services, profiles and secret references](services-secrets.md)
+- [Recovery, rollback and troubleshooting](deployment-troubleshooting.md)
+- [Deployment security boundaries and review limits](deployment-security.md)
+- [Dokku comparison and module architecture](dokku-comparison.md)
+- [Supported-target evidence and actual resource measurements](platform-verification.md)
+- [v2.1.0 development release notes and remaining gates](release-v2.1.0.md)
+- [Agent-neutral local /small-commit workflow](small-commit.md)
+
 ## Compatibility matrix
 
 | Terminal User Interface  | Podman |
@@ -92,6 +112,7 @@ podman-tui uses following keyboard keys for different actions:
 | Display images screen            | F6         |
 | Display networks screen          | F7         |
 | Display secrets screen           | F8         |
+| Display applications & deployments | F9         |
 
 ## Color Themes
 
@@ -107,4 +128,4 @@ This project is using the [Containers Community Code of Conduct](https://github.
 
 ## License
 
-Licensed under the [Apache 2.0](LICENSE) license.
+Licensed under the [Apache 2.0](../LICENSE) license.

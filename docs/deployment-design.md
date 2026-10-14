@@ -32,6 +32,18 @@ An unchanged real TUI was launched on a controlling pseudo-terminal at 100x24, d
 
 After the unchanged baseline, a dedicated rootless test machine `podman-tui-v210-test` was initialized from `quay.io/podman/machine-os:6.1` (1 CPU, 2048 MiB RAM, 10 GiB disk). Its server reports Podman **6.1.4**, Linux arm64. Do not install the macOS Docker socket helper or switch the machine rootful. All integration resources must use this explicit connection and a unique ownership label.
 
+### Failures discovered during implementation
+
+The unchanged progress-dialog test drove a live tview goroutine while asserting internal spinner counters. A later full run observed counter 3 instead of 2; after removing that incidental assertion, the unsynchronized `Run`/`Stop` setup also panicked `terminal not cursor addressable`. The test now checks display/hide and layout without a background application; forwarded title/focus and spinner-counter assertions were removed. Production progress-dialog code is unchanged. The subsequent full suite and vet passed (15 tested packages, 26 without tests).
+
+Real Linux testing found an introduced active-Quadlet cutover defect: reloading the unit before stopping the old deployment changed `ExecStop` to the replacement name. It removed the healthy candidate and timed out. The manager now checks/routes the candidate, pins images, stops the original unit under its unchanged definition, then installs the next boot definition. Failed installation recreates the old release. Core regressions pass and the corrected real cutover completed in 11.71 seconds with the replacement running.
+
+The combined cold-image service integration command hit Go's default ten-minute package deadline after Redis scenarios passed, while PostgreSQL was still pulling. Database scenarios are exercised independently rather than widening that gate. PostgreSQL and MySQL passed. MariaDB's initial protocol assertion incorrectly mixed client stderr warnings with SQL stdout; separating protocol stdout from private diagnostics preserved wrong-password rejection and made the real persistence scenario pass.
+
+Independent UI/host review identified stale-row wrong-host selection, synthetic-EOF input acceptance, unsynchronized transport publication, interrupted proxy-route absence and unjournaled image-holder leaks. Behavioral regressions failed against the prior committed implementation and passed after correction. The final suite has 17 tested packages and 24 without tests.
+
+Quadlet file updates now have a durable recovery journal and immutable environment generations, including migration from stable-file units. Failure injection checks boot-visible image/environment consistency before CLI recovery and repeat recovery after a second interruption. Real systemd testing also exposed literal quote characters being passed by incorrectly shell-quoted Podman env files; raw validated values now preserve the actual configured environment. Source-text escaping assertions were replaced with the real Podman env-file consumer and live container verification.
+
 ## Dokku gap matrix
 
 | Capability | Existing Podman-TUI | Required deployment layer |
