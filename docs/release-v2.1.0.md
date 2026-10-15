@@ -12,7 +12,8 @@
 - Optional maintained external Certbot HTTP-01/staging/renewal, private imported certificates, SAN/expiry/key checks, renewal status and systemd timer/cron generation. Public ACME/runtime scheduler verification remains unpassed.
 - Optional Linux Quadlet/systemd startup, rootless detection, scoped file ownership, immutable image pins, boot-recreated container discovery and corrected active-unit cutover ordering.
 - Optional private persistent PostgreSQL, MariaDB/MySQL and Redis services; mounted password/ACL secret references and explicitly authorized network/non-sensitive connection-setting injection.
-- F9 Applications/Services, contextual commands, JSON configuration editing, bounded sanitized progress/build output, asynchronous operations and safe Esc cancellation. F1–F8 retain their assignments; narrow menus wrap.
+- F9 Applications/Services, contextual commands, JSON configuration editing, bounded sanitized progress/build output, asynchronous operations and safe Esc cancellation. F1–F8 retain their assignments; dialogs clamp to available space.
+- Application forms, configuration editing, rollback selection and destructive confirmations now follow the original dialog components and theme. Centered/clamped layouts, visible Cancel/Save controls and Cancel-first confirmations improve narrow-terminal use; unassigned command shortcuts no longer let arrow keys activate an action.
 - Noninteractive `platform` CLI for manual/external-CI deployment without a webhook server or platform-specific background daemon.
 
 ## Security and compatibility changes

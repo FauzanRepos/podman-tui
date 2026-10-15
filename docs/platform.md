@@ -2,6 +2,10 @@
 
 The existing Podman screens remain available. F9 opens Applications / Services; `m` opens contextual commands, Enter inspects runtime health, and Esc cancels an active operation or closes a dialog. Configuration editing uses JSON in the TUI (Ctrl+S saves), including non-sensitive environment variables, profiles, ports, persistent mappings and secret references. Saved configuration is desired state; apply it with deploy. Existing F1–F8 and h/l/j/k navigation remain assigned as before.
 
+Application dialogs reuse the existing theme, centered command tables and right-aligned buttons. Forms keep Cancel before the action button; destructive confirmations initially focus Cancel. Arrow keys navigate commands even when no letter shortcut is available. Short titles and viewport-clamped panels keep controls reachable on narrow terminals.
+
+In the configuration editor, Tab / Shift+Tab cycle between JSON and Cancel / Save; Ctrl+S saves and Esc closes. Invalid JSON stays in the editor with an error so it can be corrected rather than losing the draft. Only non-sensitive configuration and secret references belong here.
+
 Application rows, command menus and delayed dialogs are bound to the connection URI/identity that produced them. Results from a previous host cannot replace the current catalog, and mutations use immutable application IDs so rename/name reuse cannot redirect an action.
 
 Ctrl+C requests safe cancellation while application work is active; retry exit once recovery completes. SIGTERM/interrupt cancellation waits for the application's bounded recovery, then stops the terminal event loop. Neither path bypasses release-state reconciliation.
@@ -93,3 +97,9 @@ Rollback redeploys a retained successful release's immutable image and configura
 The initial Go unit/build/vet baseline passed. A dedicated rootless Podman Machine server 6.1.4 (Linux arm64) has exercised image build, create/start/stop/rename, failed candidate preservation, retained-image rollback, persisted history, cross-application ownership rejection and secret-reference deployment without secret values in metadata. The opt-in integration suite uses `PODMAN_TUI_TEST_CONNECTION` and uniquely owned resources; it does not globally reset or prune. Existing Bats tests require a controlled Linux/root environment and are not safe to point at production.
 
 This is not a release announcement. Remaining integration/security/performance/platform gates and optional integration documentation are tracked in [deployment design](deployment-design.md). The version stays `2.1.0-dev`; no release tag is justified by unit tests alone.
+
+### Dialog refinement verification
+
+Live terminal checks used an isolated metadata catalog and a dedicated rootless Podman Machine connection, at 100×30 and 40×20. Create, rename, service creation/linking, TLS issue/import, configuration and destructive-confirmation dialogs were exercised without provisioning services or certificates. The editor's Cancel, Save, invalid-JSON retention and terminal-theme rendering were checked. A synthetic history entry exercised rollback selection and cancellation only, not an actual rollback.
+
+The full Go test suite, `go vet`, native build and Linux AMD64/ARM64, Darwin AMD64/ARM64 and Windows AMD64 cross-builds passed. Application tests and the command-navigation, Cancel-first confirmation and synchronous input-dialog tests passed under the race detector. The complete legacy dialog race run still reports background-event-loop races in existing command/confirmation/message/top tests; it is not a clean race result. The input-dialog test now drives keyboard events synchronously instead of racing a background renderer.

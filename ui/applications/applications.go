@@ -13,6 +13,7 @@ import (
 	"github.com/containers/podman-tui/deploy"
 	"github.com/containers/podman-tui/deploy/platform"
 	"github.com/containers/podman-tui/pdcs/registry"
+	"github.com/containers/podman-tui/ui/dialogs"
 	"github.com/containers/podman-tui/ui/style"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -278,27 +279,45 @@ func (w *screenWriter) Write(data []byte) (int, error) {
 
 func (p *Applications) menu() {
 	origin := p.connection()
-	list := tview.NewList().ShowSecondaryText(true)
-	list.SetBorder(true).SetTitle("APPLICATION COMMANDS")
-	for _, action := range []string{"create", "configure", "inspect", "status", "deploy", "deploy-maintenance", "rebuild", "rollback", "history", "start", "stop", "restart", "rename", "service-create", "service-link", "tls-status", "tls-issue", "tls-import", "tls-renew", "quadlet-status", "quadlet-enable", "quadlet-disable", "delete", "cleanup", "recover-abort"} {
-		action := action
-		list.AddItem(action, "managed applications only", 0, func() {
-			p.closeDialog()
-			if !sameEndpoint(origin, p.connection()) {
-				p.status.SetText("Connection changed; canceled stale command")
-				return
-			}
-			p.action(action)
-		})
-	}
-	list.SetInputCapture(func(e *tcell.EventKey) *tcell.EventKey {
-		if e.Key() == tcell.KeyEsc {
-			p.closeDialog()
-			return nil
-		}
-		return e
+	command := dialogs.NewCommandDialog([][]string{
+		{"create", "Create an application"},
+		{"configure", "Edit desired configuration"},
+		{"inspect", "Inspect application configuration"},
+		{"status", "Inspect runtime health"},
+		{"deploy", "Deploy the configured source"},
+		{"deploy-maintenance", "Deploy with authorized downtime"},
+		{"rebuild", "Build and deploy again"},
+		{"rollback", "Select a successful release"},
+		{"history", "View deployment history"},
+		{"start", "Start the current release"},
+		{"stop", "Stop the current release"},
+		{"restart", "Restart the current release"},
+		{"rename", "Rename the application"},
+		{"service-create", "Create a private backing service"},
+		{"service-link", "Authorize a service connection"},
+		{"tls-status", "Inspect certificate status"},
+		{"tls-issue", "Request an ACME certificate"},
+		{"tls-import", "Import an existing certificate"},
+		{"tls-renew", "Renew the managed certificate"},
+		{"quadlet-status", "Inspect startup unit status"},
+		{"quadlet-enable", "Configure automatic startup"},
+		{"quadlet-disable", "Disable automatic startup"},
+		{"delete", "Delete managed application resources"},
+		{"cleanup", "Clean eligible release artifacts"},
+		{"recover-abort", "Recover an interrupted deployment"},
 	})
-	p.showDialog(list)
+	command.SetCancelFunc(p.closeDialog)
+	command.SetSelectedFunc(func() {
+		action := command.GetSelectedItem()
+		p.closeDialog()
+		if !sameEndpoint(origin, p.connection()) {
+			p.status.SetText("Connection changed; canceled stale command")
+			return
+		}
+		p.action(action)
+	})
+	command.Display()
+	p.showDialog(command)
 }
 func (p *Applications) action(action string) {
 	if action == "create" {
@@ -340,13 +359,13 @@ func (p *Applications) action(action string) {
 	p.execute(a, action, false)
 }
 func (p *Applications) confirm(message string, action func()) {
-	modal := tview.NewModal().SetText(message).AddButtons([]string{"Cancel", "Confirm"}).SetDoneFunc(func(index int, _ string) {
-		p.closeDialog()
-		if index == 1 {
-			action()
-		}
-	})
-	p.showDialog(modal)
+	dialog := dialogs.NewConfirmDialog().SetFocusOnCancel()
+	dialog.SetTitle("confirm")
+	dialog.SetText(tview.Escape(deploy.Sanitize(message)))
+	dialog.SetCancelFunc(p.closeDialog)
+	dialog.SetSelectedFunc(func() { p.closeDialog(); action() })
+	dialog.Display()
+	p.showDialog(dialog)
 }
 func (p *Applications) execute(a target, action string, confirmed bool) {
 	connect := action != "inspect" && action != "history"
@@ -387,12 +406,12 @@ func (p *Applications) execute(a target, action string, confirmed bool) {
 	})
 }
 func (p *Applications) createForm() {
-	form := tview.NewForm()
+	form := newForm()
 	origin := p.connection()
 	name, image, repository, revision := "", "", "", "main"
 	trusted := false
 	form.AddInputField("name", "", 0, nil, func(v string) { name = v }).AddInputField("image", "", 0, nil, func(v string) { image = v }).AddInputField("repository", "", 0, nil, func(v string) { repository = v }).AddInputField("revision", revision, 0, nil, func(v string) { revision = v }).AddCheckbox("Trust build", false, func(v bool) { trusted = v })
-	form.AddButton("Create", func() {
+	form.AddButton("Cancel", p.closeDialog).AddButton("Create", func() {
 		if !sameEndpoint(origin, p.connection()) {
 			p.closeDialog()
 			return
@@ -406,46 +425,36 @@ func (p *Applications) createForm() {
 			_, err := m.Create(a)
 			return err
 		})
-	}).AddButton("Cancel", p.closeDialog)
+	})
 	form.SetBorder(true).SetTitle("CREATE APPLICATION")
 	form.SetCancelFunc(p.closeDialog)
-	p.showDialog(form)
+	p.showForm(form)
 }
 func (p *Applications) configureForm(a target) {
 	data, _ := json.MarshalIndent(a.Application, "", "  ")
-	editor := tview.NewTextArea().SetText(string(data), false).SetWrap(false)
-	editor.SetBorder(true).SetTitle("CONFIGURATION: non-sensitive env / secret refs / profiles / ports / domains (Ctrl+S saves)")
-	editor.SetInputCapture(func(e *tcell.EventKey) *tcell.EventKey {
-		if e.Key() == tcell.KeyEsc {
-			p.closeDialog()
-			return nil
+	editor := tview.NewTextArea().SetText(string(data), false).SetWrap(true)
+	p.showEditor(editor, func() error {
+		var updated deploy.Application
+		if err := json.Unmarshal([]byte(editor.GetText()), &updated); err != nil {
+			return err
 		}
-		if e.Key() == tcell.KeyCtrlS {
-			value := editor.GetText()
-			p.closeDialog()
-			p.runTarget(a, false, func(_ context.Context, m *deploy.Manager, _ io.Writer) error {
-				var updated deploy.Application
-				if err := json.Unmarshal([]byte(value), &updated); err != nil {
-					return err
-				}
-				return m.Configure(a.key(), updated)
-			})
-			return nil
-		}
-		return e
+		p.closeDialog()
+		p.runTarget(a, false, func(_ context.Context, m *deploy.Manager, _ io.Writer) error {
+			return m.Configure(a.key(), updated)
+		})
+		return nil
 	})
-	p.showDialog(editor)
 }
 func (p *Applications) renameForm(a target) {
 	name := a.Name
-	form := tview.NewForm().AddInputField("new name", name, 0, nil, func(v string) { name = v })
-	form.AddButton("Rename", func() {
+	form := newForm().AddInputField("new name", name, 0, nil, func(v string) { name = v })
+	form.AddButton("Cancel", p.closeDialog).AddButton("Rename", func() {
 		p.closeDialog()
 		p.runTarget(a, false, func(_ context.Context, m *deploy.Manager, _ io.Writer) error { return m.Rename(a.key(), name) })
-	}).AddButton("Cancel", p.closeDialog)
+	})
 	form.SetBorder(true).SetTitle("RENAME APPLICATION")
 	form.SetCancelFunc(p.closeDialog)
-	p.showDialog(form)
+	p.showForm(form)
 }
 func (p *Applications) rollback(a target) {
 	p.runTarget(a, false, func(_ context.Context, m *deploy.Manager, _ io.Writer) error {
@@ -454,25 +463,32 @@ func (p *Applications) rollback(a target) {
 			return err
 		}
 		p.queueFor(a.origin, func() {
-			list := tview.NewList()
-			list.SetBorder(true).SetTitle("ROLLBACK (persistent data/migrations unchanged)")
+			options := make([][]string, 0, len(history))
 			for i := len(history) - 1; i >= 0; i-- {
 				r := history[i]
 				if r.Status != "successful" {
 					continue
 				}
-				list.AddItem(r.ID, fmt.Sprintf("%s %s", r.Timestamp.Format(time.RFC3339), r.ImageID), 0, func() {
-					p.closeDialog()
-					p.confirm("Rollback "+a.Name+" to "+r.ID+"? Database migrations are not reverted.", func() {
-						p.runTarget(a, true, func(ctx context.Context, m *deploy.Manager, out io.Writer) error {
-							_, err := m.Deploy(ctx, a.key(), deploy.DeployOptions{RollbackRelease: r.ID}, nil, out)
-							return err
-						})
+				options = append(options, []string{r.ID, fmt.Sprintf("%s %s", r.Timestamp.Format(time.RFC3339), r.ImageID)})
+			}
+			if len(options) == 0 {
+				p.status.SetText("No successful release is available for rollback")
+				return
+			}
+			command := dialogs.NewCommandDialog(options)
+			command.SetCancelFunc(p.closeDialog)
+			command.SetSelectedFunc(func() {
+				releaseID := command.GetSelectedItem()
+				p.closeDialog()
+				p.confirm("Rollback "+a.Name+" to "+releaseID+"? Database migrations are not reverted.", func() {
+					p.runTarget(a, true, func(ctx context.Context, m *deploy.Manager, out io.Writer) error {
+						_, err := m.Deploy(ctx, a.key(), deploy.DeployOptions{RollbackRelease: releaseID}, nil, out)
+						return err
 					})
 				})
-			}
-			list.AddItem("Cancel", "", 0, p.closeDialog)
-			p.showDialog(list)
+			})
+			command.Display()
+			p.showDialog(command)
 		})
 		return nil
 	})

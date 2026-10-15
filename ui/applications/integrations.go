@@ -10,14 +10,13 @@ import (
 	"github.com/containers/podman-tui/deploy/platform"
 	"github.com/containers/podman-tui/deploy/proxy"
 	"github.com/containers/podman-tui/deploy/quadlet"
-	"github.com/rivo/tview"
 )
 
 func (p *Applications) serviceForm() {
 	origin := p.connection()
 	name, secret, network, kind := "", "", "", "postgres"
-	form := tview.NewForm().AddInputField("name", "", 0, nil, func(v string) { name = v }).AddDropDown("type", []string{"postgres", "mariadb", "mysql", "redis"}, 0, func(v string, _ int) { kind = v }).AddInputField("secret ref", "", 0, nil, func(v string) { secret = v }).AddInputField("network", "", 0, nil, func(v string) { network = v })
-	form.AddButton("Create", func() {
+	form := newForm().AddInputField("name", "", 0, nil, func(v string) { name = v }).AddDropDown("type", []string{"postgres", "mariadb", "mysql", "redis"}, 0, func(v string, _ int) { kind = v }).AddInputField("secret ref", "", 0, nil, func(v string) { secret = v }).AddInputField("network", "", 0, nil, func(v string) { network = v })
+	form.AddButton("Cancel", p.closeDialog).AddButton("Create", func() {
 		if !sameEndpoint(origin, p.connection()) {
 			p.closeDialog()
 			return
@@ -27,24 +26,24 @@ func (p *Applications) serviceForm() {
 			_, err := platform.CreateService(ctx, m, name, kind, secret, network, out)
 			return err
 		})
-	}).AddButton("Cancel", p.closeDialog)
-	form.SetBorder(true).SetTitle("PRIVATE BACKING SERVICE (existing secret reference; no public ports)")
+	})
+	form.SetBorder(true).SetTitle("PRIVATE BACKING SERVICE")
 	form.SetCancelFunc(p.closeDialog)
-	p.showDialog(form)
+	p.showForm(form)
 }
 func (p *Applications) linkForm(a target) {
 	name := ""
 	inject := false
-	form := tview.NewForm().AddInputField("service", "", 0, nil, func(v string) { name = v }).AddCheckbox("Inject host", false, func(v bool) { inject = v })
-	form.AddButton("Link", func() {
+	form := newForm().AddInputField("service", "", 0, nil, func(v string) { name = v }).AddCheckbox("Inject host", false, func(v bool) { inject = v })
+	form.AddButton("Cancel", p.closeDialog).AddButton("Link", func() {
 		p.closeDialog()
 		p.runTarget(a, false, func(_ context.Context, m *deploy.Manager, _ io.Writer) error {
 			return platform.LinkService(m, a.key(), name, inject)
 		})
-	}).AddButton("Cancel", p.closeDialog)
-	form.SetBorder(true).SetTitle("AUTHORIZE SERVICE NETWORK / NON-SENSITIVE SETTINGS")
+	})
+	form.SetBorder(true).SetTitle("AUTHORIZE SERVICE NETWORK")
 	form.SetCancelFunc(p.closeDialog)
-	p.showDialog(form)
+	p.showForm(form)
 }
 func routerFor(m *deploy.Manager) (*proxy.Router, error) {
 	r, ok := m.Router.(*proxy.Router)
@@ -56,8 +55,8 @@ func routerFor(m *deploy.Manager) (*proxy.Router, error) {
 func (p *Applications) tlsIssueForm(a target) {
 	email := ""
 	staging, agree := true, false
-	form := tview.NewForm().AddInputField("email", "", 0, nil, func(v string) { email = v }).AddCheckbox("Staging CA", true, func(v bool) { staging = v }).AddCheckbox("Agree terms", false, func(v bool) { agree = v })
-	form.AddButton("Issue", func() {
+	form := newForm().AddInputField("email", "", 0, nil, func(v string) { email = v }).AddCheckbox("Staging CA", true, func(v bool) { staging = v }).AddCheckbox("Agree terms", false, func(v bool) { agree = v })
+	form.AddButton("Cancel", p.closeDialog).AddButton("Issue", func() {
 		p.closeDialog()
 		p.runTarget(a, true, func(ctx context.Context, m *deploy.Manager, _ io.Writer) error {
 			router, err := routerFor(m)
@@ -68,15 +67,15 @@ func (p *Applications) tlsIssueForm(a target) {
 				return proxy.NewTLS(router).Issue(ctx, current, c, email, staging, agree)
 			})
 		})
-	}).AddButton("Cancel", p.closeDialog)
-	form.SetBorder(true).SetTitle("ACME HTTP-01 (requires public DNS/reachability and configured webroot)")
+	})
+	form.SetBorder(true).SetTitle("ACME HTTP-01")
 	form.SetCancelFunc(p.closeDialog)
-	p.showDialog(form)
+	p.showForm(form)
 }
 func (p *Applications) tlsImportForm(a target) {
 	certificate, key := "", ""
-	form := tview.NewForm().AddInputField("certificate", "", 0, nil, func(v string) { certificate = v }).AddInputField("key file", "", 0, nil, func(v string) { key = v })
-	form.AddButton("Import", func() {
+	form := newForm().AddInputField("certificate", "", 0, nil, func(v string) { certificate = v }).AddInputField("key file", "", 0, nil, func(v string) { key = v })
+	form.AddButton("Cancel", p.closeDialog).AddButton("Import", func() {
 		p.closeDialog()
 		p.runTarget(a, true, func(ctx context.Context, m *deploy.Manager, _ io.Writer) error {
 			router, err := routerFor(m)
@@ -87,10 +86,10 @@ func (p *Applications) tlsImportForm(a target) {
 				return proxy.NewTLS(router).Import(ctx, current, c, certificate, key)
 			})
 		})
-	}).AddButton("Cancel", p.closeDialog)
-	form.SetBorder(true).SetTitle("IMPORT LOCAL CERTIFICATE (key path only; contents are never previewed)")
+	})
+	form.SetBorder(true).SetTitle("IMPORT LOCAL CERTIFICATE")
 	form.SetCancelFunc(p.closeDialog)
-	p.showDialog(form)
+	p.showForm(form)
 }
 func (p *Applications) integrationAction(a target, action string) bool {
 	switch action {

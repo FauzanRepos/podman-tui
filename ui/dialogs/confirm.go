@@ -24,6 +24,7 @@ type ConfirmDialog struct {
 	message       string
 	display       bool
 	firstDisplay  bool
+	focusCancel   bool
 	cancelHandler func()
 	selectHandler func()
 }
@@ -86,6 +87,12 @@ func (d *ConfirmDialog) SetTitle(title string) {
 	d.layout.SetTitleColor(style.DialogFgColor)
 }
 
+// SetFocusOnCancel starts each display on Cancel without changing other callers.
+func (d *ConfirmDialog) SetFocusOnCancel() *ConfirmDialog {
+	d.focusCancel = true
+	return d
+}
+
 // SetText sets dialog title.
 func (d *ConfirmDialog) SetText(message string) {
 	d.message = message
@@ -103,7 +110,11 @@ func (d *ConfirmDialog) Focus(delegate func(p tview.Primitive)) {
 	if d.firstDisplay {
 		d.firstDisplay = false
 
-		d.form.SetFocus(1)
+		index := 1
+		if d.focusCancel {
+			index = 0
+		}
+		d.form.SetFocus(index)
 		delegate(d.form)
 
 		return
@@ -119,10 +130,14 @@ func (d *ConfirmDialog) HasFocus() bool {
 
 // SetRect set rects for this primitive.
 func (d *ConfirmDialog) SetRect(x, y, width, height int) {
-	d.x = x + DialogPadding
-	d.y = y + DialogPadding
-	d.width = width - (2 * DialogPadding)   //nolint:mnd
-	d.height = height - (2 * DialogPadding) //nolint:mnd
+	padding := DialogPadding
+	if width < 2*DialogMinWidth || height < 15 {
+		padding = 0
+	}
+	d.x = x + padding
+	d.y = y + padding
+	d.width = max(0, width-2*padding)
+	d.height = max(0, height-2*padding)
 	d.setRect()
 }
 
@@ -147,6 +162,10 @@ func (d *ConfirmDialog) InputHandler() func(event *tcell.EventKey, setFocus func
 		if event.Key() == tcell.KeyEsc {
 			d.cancelHandler()
 
+			return
+		}
+		if event.Key() == tcell.KeyPgDn || event.Key() == tcell.KeyPgUp {
+			d.textview.InputHandler()(event, setFocus)
 			return
 		}
 
@@ -179,35 +198,13 @@ func (d *ConfirmDialog) SetSelectedFunc(handler func()) *ConfirmDialog {
 func (d *ConfirmDialog) setRect() {
 	maxHeight := d.height
 	maxWidth := d.width
-	messageHeight := len(strings.Split(d.message, "\n"))
 	messageWidth := getMessageWidth(d.message)
-
-	layoutHeight := messageHeight + 2 //nolint:mnd
-
-	if maxHeight > layoutHeight+DialogFormHeight {
-		d.height = layoutHeight + DialogFormHeight + 2 //nolint:mnd
-	} else {
-		d.height = maxHeight
-		layoutHeight = d.height - DialogFormHeight - 2 //nolint:mnd
-	}
-
-	if maxHeight > d.height {
-		emptyHeight := (maxHeight - d.height) / 2 //nolint:mnd
-		d.y += emptyHeight
-	}
-
-	if d.width > DialogMinWidth {
-		if messageWidth < DialogMinWidth {
-			d.width = DialogMinWidth + 4 //nolint:mnd
-		} else if messageWidth < d.width {
-			d.width = messageWidth + 6 //nolint:mnd
-		}
-	}
-
-	if maxWidth > d.width {
-		emptyWidth := (maxWidth - d.width) / 2 //nolint:mnd
-		d.x += emptyWidth
-	}
+	d.width = min(maxWidth, max(DialogMinWidth+4, messageWidth+6))
+	messageHeight := len(tview.WordWrap(d.message, max(1, d.width-4)))
+	layoutHeight := min(max(0, maxHeight-DialogFormHeight-2), messageHeight+2)
+	d.height = min(maxHeight, layoutHeight+DialogFormHeight+2)
+	d.x += (maxWidth - d.width) / 2
+	d.y += (maxHeight - d.height) / 2
 
 	msgLayout := tview.NewFlex().SetDirection(tview.FlexColumn)
 	msgLayout.AddItem(utils.EmptyBoxSpace(style.DialogBgColor), 1, 0, false)

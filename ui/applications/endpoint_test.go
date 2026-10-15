@@ -34,7 +34,9 @@ func TestStaleOperationAndDialogCannotCrossEndpoints(t *testing.T) {
 	mb, ab := makeManager(b)
 	conn := a
 	completion := make(chan struct{}, 1)
-	page := New(func(f func()) { f(); completion <- struct{}{} }, func(tview.Primitive) {}, func() registry.Connection { return conn })
+	application := tview.NewApplication()
+	focus := func(p tview.Primitive) { application.SetFocus(p) }
+	page := New(func(f func()) { f(); completion <- struct{}{} }, focus, func() registry.Connection { return conn })
 	await := func() {
 		t.Helper()
 		select {
@@ -47,11 +49,13 @@ func TestStaleOperationAndDialogCannotCrossEndpoints(t *testing.T) {
 	await()
 	page.action("rename")
 	_, primitive := page.GetFrontPage()
-	form, ok := primitive.(*tview.Form)
-	if !ok {
-		t.Fatal("rename form unavailable")
+	renameDialog := primitive
+	application.SetFocus(renameDialog)
+	renameDialog.InputHandler()(tcell.NewEventKey(tcell.KeyCtrlU, 0, tcell.ModNone), focus)
+	for _, char := range "renamed" {
+		renameDialog.InputHandler()(tcell.NewEventKey(tcell.KeyRune, char, tcell.ModNone), focus)
 	}
-	form.GetFormItem(0).(*tview.InputField).SetText("renamed")
+	renameDialog.InputHandler()(tcell.NewEventKey(tcell.KeyBacktab, 0, tcell.ModNone), focus)
 	started, resume := make(chan struct{}), make(chan struct{})
 	page.run(false, func(context.Context, *deploy.Manager, io.Writer) error { close(started); <-resume; return nil })
 	select {
@@ -73,7 +77,8 @@ func TestStaleOperationAndDialogCannotCrossEndpoints(t *testing.T) {
 	if err != nil || selected.ID != ab.ID {
 		t.Fatal("old worker replaced current-host rows", err)
 	}
-	form.GetButton(0).InputHandler()(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone), func(tview.Primitive) {})
+	application.SetFocus(renameDialog)
+	renameDialog.InputHandler()(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone), focus)
 	for _, m := range []*deploy.Manager{ma, mb} {
 		if _, err = m.Get("web"); err != nil {
 			t.Fatal("stale dialog renamed an application", err)
