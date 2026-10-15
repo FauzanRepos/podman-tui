@@ -98,9 +98,13 @@ func NewCommandDialog(options [][]string) *CommandDialog {
 				SetSelectable(true).SetTextColor(style.DialogFgColor))
 
 		shortcut := shortcuts[i]
+		shortcutLabel := ""
+		if shortcut != 0 {
+			shortcutLabel = string(shortcut)
+		}
 
 		cmdsTable.SetCell(i+1, colKeyIndex,
-			tview.NewTableCell(string(shortcut)).
+			tview.NewTableCell(shortcutLabel).
 				SetAlign(tview.AlignCenter).
 				SetSelectable(true).SetTextColor(style.DialogFgColor))
 		cmdsTable.SetCell(i+1, colDescIndex,
@@ -248,7 +252,7 @@ func (cmd *CommandDialog) InputHandler() func(event *tcell.EventKey, setFocus fu
 			}
 
 			for row, shortcut := range cmd.shortcuts {
-				if event.Rune() == shortcut {
+				if shortcut != 0 && event.Rune() == shortcut {
 					cmd.table.Select(row+1, 0)
 					cmd.selectHandler()
 
